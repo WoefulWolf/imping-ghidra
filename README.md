@@ -7,7 +7,7 @@ Status: early development, not published. Supports x86 and x64 PE programs; test
 ## What is exported
 
 - **Functions:** every function in the program whose name is not a Ghidra default (`FUN_…`), except the exception-handling funclets Ghidra's analysis names (`Unwind@…`, `Catch@…`), which are compiler-generated pieces of other functions. Its Ghidra function tags are kept, and its first bytes (up to 16, stopping before any byte the loader relocates) are recorded so a hook can check it is patching the expected code.
-- **Globals:** every data label whose name is not a Ghidra default (`DAT_…`, `PTR_…`, `s_…`).
+- **Globals:** every data label a user or a symbol source named. Left out are Ghidra's default names (`DAT_…`, `PTR_…`, `s_…`), names its analysis generates (switch tables such as `switchdataD_…`, thread-block fields), and the RTTI metadata its class recovery labels (`RTTI_…`, `vftable_meta_ptr`). Virtual function tables (`vftable`) are kept.
 - **Types:** only those used by the exported functions and globals, directly or through other types.
 - **Identity:** the module's file name, image base, timestamp and image size from its PE header, and its SHA-256 when Ghidra recorded one.
 

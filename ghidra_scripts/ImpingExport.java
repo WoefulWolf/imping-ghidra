@@ -4,9 +4,11 @@
 // Exported functions are the non-external functions whose names are not Ghidra
 // defaults (not FUN_...), except the exception-handling funclets Ghidra's
 // analysis names (Unwind@..., Catch@...). Exported globals are the data
-// labels that are not defaults (not DAT_..., PTR_..., s_...). Types are
-// exported only when an exported function or global uses them, directly or
-// through other types.
+// labels a user or a symbol source named: not defaults (DAT_..., PTR_...,
+// s_...), not names Ghidra's analysis generated (switchdataD_...), and not
+// RTTI metadata (RTTI_..., vftable_meta_ptr); vftable labels are kept. Types
+// are exported only when an exported function or global uses them, directly
+// or through other types.
 //
 // In the GUI, the script asks where to save the file. Headless, pass the output
 // path as the script's argument:
@@ -88,6 +90,9 @@ public class ImpingExport extends GhidraScript {
     /** Names Ghidra's analysis gives exception-handling funclets. */
     private static final Pattern EXCEPTION_FUNCLET =
         Pattern.compile("(Unwind|Catch|Catch_All)@[0-9a-fA-F]+");
+
+    /** Labels Ghidra's class recovery gives RTTI metadata. */
+    private static final Pattern RTTI_METADATA = Pattern.compile("RTTI_.*|vftable_meta_ptr");
 
     @Override
     protected void run() throws Exception {
@@ -187,6 +192,7 @@ public class ImpingExport extends GhidraScript {
                 if (symbol.getSymbolType() != SymbolType.LABEL
                         || symbol.isExternal()
                         || symbol.getSource() == SourceType.DEFAULT
+                        || isGeneratedDataLabel(symbol)
                         || !symbol.isPrimary()
                         || !address.isMemoryAddress()
                         || !isLoaded(address)
@@ -402,6 +408,18 @@ public class ImpingExport extends GhidraScript {
         private boolean isExceptionFunclet(Function function) {
             return function.getSymbol().getSource() == SourceType.ANALYSIS
                 && EXCEPTION_FUNCLET.matcher(function.getName()).matches();
+        }
+
+        /**
+         * Whether a data label was generated rather than chosen: any label
+         * Ghidra's analysis named (switch tables such as switchdataD_...,
+         * thread-block fields), and the RTTI metadata labels its class
+         * recovery creates (RTTI_... descriptors, vftable_meta_ptr). Labels of
+         * virtual function tables (vftable) are kept.
+         */
+        private boolean isGeneratedDataLabel(Symbol symbol) {
+            return symbol.getSource() == SourceType.ANALYSIS
+                || RTTI_METADATA.matcher(symbol.getName()).matches();
         }
 
         /** A function's parameters, without a hidden return-storage pointer. */

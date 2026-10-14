@@ -229,6 +229,13 @@ fn exports_the_fixture_program() {
         module.globals.iter().all(|g| !g.name.starts_with("DAT_")),
         "globals with default names are not exported"
     );
+    let generated = |name: &str| {
+        name.starts_with("switchdataD_") || name.starts_with("RTTI_") || name == "vftable_meta_ptr"
+    };
+    assert!(
+        module.globals.iter().all(|g| !generated(&g.name)),
+        "generated data labels are not exported"
+    );
 
     // The program database places a crate's items in a namespace named after it.
     let add = function(module, "fixture_add");
