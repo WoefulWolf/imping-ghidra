@@ -2,9 +2,11 @@
 // every function and global with a non-default name, and the types they use.
 //
 // Exported functions are the non-external functions whose names are not Ghidra
-// defaults (not FUN_...). Exported globals are the data labels that are not
-// defaults (not DAT_..., PTR_..., s_...). Types are exported only when an
-// exported function or global uses them, directly or through other types.
+// defaults (not FUN_...), except the exception-handling funclets Ghidra's
+// analysis names (Unwind@..., Catch@...). Exported globals are the data
+// labels that are not defaults (not DAT_..., PTR_..., s_...). Types are
+// exported only when an exported function or global uses them, directly or
+// through other types.
 //
 // In the GUI, the script asks where to save the file. Headless, pass the output
 // path as the script's argument:
@@ -72,6 +74,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeSet;
+import java.util.regex.Pattern;
 
 public class ImpingExport extends GhidraScript {
 
@@ -81,6 +84,10 @@ public class ImpingExport extends GhidraScript {
 
     /** The most bytes recorded to verify a function's start before hooking it. */
     private static final int VERIFICATION_BYTES = 16;
+
+    /** Names Ghidra's analysis gives exception-handling funclets. */
+    private static final Pattern EXCEPTION_FUNCLET =
+        Pattern.compile("(Unwind|Catch|Catch_All)@[0-9a-fA-F]+");
 
     @Override
     protected void run() throws Exception {
@@ -166,6 +173,7 @@ public class ImpingExport extends GhidraScript {
                 monitor.checkCancelled();
                 if (!function.isExternal()
                         && function.getSymbol().getSource() != SourceType.DEFAULT
+                        && !isExceptionFunclet(function)
                         && isLoaded(function.getEntryPoint())
                         && rva(function.getEntryPoint()) >= 0) {
                     functions.add(function);
@@ -384,6 +392,17 @@ public class ImpingExport extends GhidraScript {
         }
 
         // ---------------------------------------------------------- functions
+
+        /**
+         * Whether a function is an exception-handling funclet that Ghidra's
+         * analysis named (Unwind@..., Catch@..., Catch_All@...). Such names are
+         * not defaults, but the funclets are compiler-generated pieces of other
+         * functions, not functions to call or hook. A name a user chose is kept.
+         */
+        private boolean isExceptionFunclet(Function function) {
+            return function.getSymbol().getSource() == SourceType.ANALYSIS
+                && EXCEPTION_FUNCLET.matcher(function.getName()).matches();
+        }
 
         /** A function's parameters, without a hidden return-storage pointer. */
         private List<Parameter> parameters(Function function) {

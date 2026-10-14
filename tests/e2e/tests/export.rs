@@ -216,6 +216,15 @@ fn exports_the_fixture_program() {
         module.functions.iter().all(|f| !f.name.starts_with("FUN_")),
         "functions with default names are not exported"
     );
+    let funclet = |name: &str| {
+        ["Unwind@", "Catch@", "Catch_All@"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    };
+    assert!(
+        module.functions.iter().all(|f| !funclet(&f.name)),
+        "exception-handling funclets are not exported"
+    );
     assert!(
         module.globals.iter().all(|g| !g.name.starts_with("DAT_")),
         "globals with default names are not exported"
