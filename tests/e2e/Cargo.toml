@@ -1,0 +1,16 @@
+[package]
+name = "e2e"
+description = "End-to-end test of the exporter: fixture program to IR to bindings."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+# Sibling suite repos, by relative path during development.
+imping-ir = { path = "../../../imping-ir" }
+imping-codegen = { path = "../../../imping-codegen/crates/imping-codegen" }
+
+[lints]
+workspace = true
