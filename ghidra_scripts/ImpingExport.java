@@ -10,6 +10,14 @@
 // are exported only when an exported function or global uses them, directly
 // or through other types.
 //
+// A struct's field at offset 0 is marked as its base class from the program's
+// MSVC RTTI (x64) when RTTI describes a class of exactly the struct's name: the
+// field is the base when its type is the class's first base, or another base
+// RTTI places at offset 0 (template names compare without their arguments).
+// Where RTTI contradicts a field named `base`, the field is not marked and a
+// warning says why. A struct RTTI does not describe falls back to its name: a
+// struct field at offset 0 named `base` is the base.
+//
 // In the GUI, the script asks where to save the file. Headless, pass the output
 // path as the script's argument:
 //
@@ -21,8 +29,11 @@
 //@category imping
 
 import com.google.gson.stream.JsonWriter;
+import ghidra.app.cmd.data.TypeDescriptorModel;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.util.datatype.microsoft.DataValidationOptions;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.data.AbstractFloatDataType;
@@ -67,6 +78,8 @@ import ghidra.program.model.symbol.SymbolType;
 import java.io.File;
 import java.io.IOException;
 import java.io.Writer;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -82,7 +95,7 @@ public class ImpingExport extends GhidraScript {
 
     /** The IR format version this script writes. */
     private static final int FORMAT_MAJOR = 1;
-    private static final int FORMAT_MINOR = 0;
+    private static final int FORMAT_MINOR = 1;
 
     /** The most bytes recorded to verify a function's start before hooking it. */
     private static final int VERIFICATION_BYTES = 16;
@@ -107,6 +120,9 @@ public class ImpingExport extends GhidraScript {
             json.setIndent("  ");
             exporter.write(json);
         }
+        for (String warning : exporter.warnings) {
+            println("imping: warning: " + warning);
+        }
         println(String.format("imping: exported %d functions, %d globals and %d types to %s",
             exporter.functions.size(), exporter.globals.size(), exporter.types.size(), output));
     }
@@ -127,8 +143,8 @@ public class ImpingExport extends GhidraScript {
     /** One global: its symbol and data. */
     private record GlobalItem(Symbol symbol, Data data) {}
 
-    /** A type in the IR's type table. */
-    private record TypeEntry(int id, String name, TypeBody body) {}
+    /** A type in the IR's type table: its namespace path and name. */
+    private record TypeEntry(int id, List<String> namespace, String name, TypeBody body) {}
 
     /** Writes the kind-specific part of a type entry. */
     @FunctionalInterface
@@ -136,8 +152,12 @@ public class ImpingExport extends GhidraScript {
         void write(JsonWriter json) throws IOException;
     }
 
+    /** One base class RTTI lists for a class: its name and offset in the class. */
+    private record RttiBase(String name, int offset, boolean isVirtual) {}
+
     /** One field of a struct or union, resolved to type ids. */
-    private record FieldEntry(String name, int type, long offset, int bitOffset, int bitWidth) {
+    private record FieldEntry(String name, int type, long offset, int bitOffset, int bitWidth,
+            boolean base) {
         boolean isBitField() {
             return bitWidth > 0;
         }
@@ -154,7 +174,11 @@ public class ImpingExport extends GhidraScript {
         final List<Function> functions = new ArrayList<>();
         final List<GlobalItem> globals = new ArrayList<>();
         final List<TypeEntry> types = new ArrayList<>();
+        /** Contradictions found while exporting, for the user to check. */
+        final List<String> warnings = new ArrayList<>();
         private final Map<String, Integer> typeIds = new HashMap<>();
+        /** RTTI's base classes by class name (see {@link #normalize}), read on first use. */
+        private Map<String, List<RttiBase>> rttiClasses;
 
         Exporter(Program program) {
             this.program = program;
@@ -253,6 +277,13 @@ public class ImpingExport extends GhidraScript {
                 json.beginObject();
                 json.name("id").value(entry.id());
                 json.name("name").value(entry.name());
+                if (!entry.namespace().isEmpty()) {
+                    json.name("namespace").beginArray();
+                    for (String segment : entry.namespace()) {
+                        json.value(segment);
+                    }
+                    json.endArray();
+                }
                 entry.body().write(json);
                 json.endObject();
             }
@@ -351,6 +382,36 @@ public class ImpingExport extends GhidraScript {
             }
             json.endObject();
             return false;
+        }
+
+        /**
+         * Splits a C++ name at its top-level `::` into namespace segments and the
+         * name: `Hw::cVec4` is `[Hw, cVec4]`, and `lib::Array<hap::Token>` is
+         * `[lib, Array<hap::Token>]`, since template arguments (and parameter
+         * lists inside them) are kept whole. A name without `::` is one segment.
+         */
+        private static List<String> splitPath(String name) {
+            List<String> segments = new ArrayList<>();
+            int depth = 0;
+            int start = 0;
+            for (int i = 0; i < name.length(); i++) {
+                char c = name.charAt(i);
+                if (c == '<' || c == '(') {
+                    depth++;
+                } else if ((c == '>' || c == ')') && depth > 0) {
+                    depth--;
+                } else if (depth == 0 && c == ':' && i + 1 < name.length() && name.charAt(i + 1) == ':') {
+                    if (i > start) {
+                        segments.add(name.substring(start, i));
+                    }
+                    start = i + 2;
+                    i++;
+                }
+            }
+            if (start < name.length() || segments.isEmpty()) {
+                segments.add(name.substring(start));
+            }
+            return segments;
         }
 
         private void writeNamespace(JsonWriter json, Namespace namespace) throws IOException {
@@ -536,8 +597,20 @@ public class ImpingExport extends GhidraScript {
                 return existing;
             }
             int id = reserve(key);
-            types.set(id, new TypeEntry(id, type.getName(), describe(type)));
+            List<String> path = isNamedItem(type) ? splitPath(type.getName()) : List.of(type.getName());
+            List<String> namespace = path.subList(0, path.size() - 1);
+            types.set(id, new TypeEntry(id, namespace, path.get(path.size() - 1), describe(type)));
             return id;
+        }
+
+        /**
+         * Whether a type becomes a named item in generated code (struct, union,
+         * enum or typedef), so that a namespace path in its name is meaningful.
+         * Pointers, arrays and built-ins are named after what they point to or hold.
+         */
+        private static boolean isNamedItem(DataType type) {
+            return type instanceof Structure || type instanceof Union || type instanceof Enum
+                || type instanceof TypeDef;
         }
 
         /** The id of a synthesised type, adding it on first use. */
@@ -547,7 +620,7 @@ public class ImpingExport extends GhidraScript {
                 return existing;
             }
             int id = reserve(key);
-            types.set(id, new TypeEntry(id, name, body));
+            types.set(id, new TypeEntry(id, List.of(), name, body));
             return id;
         }
 
@@ -634,14 +707,14 @@ public class ImpingExport extends GhidraScript {
                     return opaqueBody(0);
                 }
                 return composite("struct", structure.getLength(), structure.getAlignment(),
-                    fields(structure.getDefinedComponents()));
+                    fields(structure.getDefinedComponents(), baseComponent(structure)));
             }
             if (type instanceof Union union) {
                 if (union.isNotYetDefined()) {
                     return opaqueBody(0);
                 }
                 return composite("union", union.getLength(), union.getAlignment(),
-                    fields(union.getDefinedComponents()));
+                    fields(union.getDefinedComponents(), null));
             }
             if (type instanceof Enum enumeration) {
                 String primitive = integer(enumeration.getLength(), enumeration.isSigned());
@@ -729,6 +802,9 @@ public class ImpingExport extends GhidraScript {
                     json.name("name").value(field.name());
                     json.name("type").value(field.type());
                     json.name("offset").value(field.offset());
+                    if (field.base()) {
+                        json.name("base").value(true);
+                    }
                     if (field.isBitField()) {
                         json.name("bits").beginObject();
                         json.name("bit_offset").value(field.bitOffset());
@@ -746,7 +822,7 @@ public class ImpingExport extends GhidraScript {
          * the IR places it in a storage unit of its declared type, aligned to
          * that type's size, so the bitfields sharing a unit share an offset.
          */
-        private List<FieldEntry> fields(DataTypeComponent[] components) {
+        private List<FieldEntry> fields(DataTypeComponent[] components, DataTypeComponent baseField) {
             List<FieldEntry> fields = new ArrayList<>();
             for (DataTypeComponent component : components) {
                 String name = component.getFieldName();
@@ -768,13 +844,202 @@ public class ImpingExport extends GhidraScript {
                         unit = component.getOffset();
                         bitOffset = bits.getBitOffset();
                     }
-                    fields.add(new FieldEntry(name, typeId(base), unit, (int) bitOffset, bits.getBitSize()));
+                    fields.add(new FieldEntry(name, typeId(base), unit, (int) bitOffset, bits.getBitSize(),
+                        false));
                 } else {
                     fields.add(new FieldEntry(name, typeId(component.getDataType()),
-                        component.getOffset(), 0, 0));
+                        component.getOffset(), 0, 0, component == baseField));
                 }
             }
             return fields;
+        }
+
+        // --------------------------------------------------------- base classes
+
+        /**
+         * The field to mark as a struct's base class, or null. Where RTTI
+         * describes a class of exactly the struct's name, the struct field at
+         * offset 0 is the base when its type is a base RTTI places at offset 0
+         * (template names compare without their arguments), whatever the field
+         * is called; a field named {@code base} that RTTI contradicts is not
+         * marked, and a warning says why. Otherwise a struct field at offset 0
+         * named {@code base} is the base.
+         */
+        private DataTypeComponent baseComponent(Structure structure) {
+            DataTypeComponent first = null;
+            for (DataTypeComponent component : structure.getDefinedComponents()) {
+                if (component.getOffset() == 0 && !component.isBitFieldComponent()) {
+                    first = component;
+                    break;
+                }
+            }
+            Structure fieldType = first == null ? null : asStructure(first.getDataType());
+            if (fieldType == null) {
+                return null;
+            }
+            boolean namedBase = "base".equals(first.getFieldName());
+            List<RttiBase> bases = rtti().get(normalize(structure.getName()));
+            if (bases == null) {
+                return namedBase ? first : null;
+            }
+            List<RttiBase> atZero = new ArrayList<>();
+            for (RttiBase base : bases) {
+                if (base.offset() == 0 && !base.isVirtual()) {
+                    atZero.add(base);
+                }
+            }
+            String field = normalize(fieldType.getName());
+            for (RttiBase base : atZero) {
+                String name = normalize(base.name());
+                if (name.equals(field) || sameTemplate(name, field)) {
+                    return first;
+                }
+            }
+            if (namedBase && atZero.isEmpty()) {
+                warnings.add(String.format(
+                    "RTTI lists no base at offset 0 for %s, but its field `%s` there is named like a"
+                        + " base; not marked as a base.",
+                    structure.getName(), first.getFieldName()));
+            } else if (namedBase) {
+                warnings.add(String.format(
+                    "RTTI lists %s's base at offset 0 as %s, but its field `%s` there is a %s; not"
+                        + " marked as a base.",
+                    structure.getName(), atZero.get(0).name(), first.getFieldName(), fieldType.getName()));
+            }
+            return null;
+        }
+
+        /** The structure a type is, through typedefs, or null. */
+        private static Structure asStructure(DataType type) {
+            DataType resolved = type instanceof TypeDef typedef ? typedef.getBaseDataType() : type;
+            return resolved instanceof Structure structure ? structure : null;
+        }
+
+        /**
+         * A C++ type name in one spelling: without `class`, `struct`, `union` or
+         * `enum` keywords, `__ptr64` or whitespace.
+         */
+        private static String normalize(String name) {
+            return name.replaceAll("\\b(class|struct|union|enum)\\s+", "")
+                .replace("__ptr64", "")
+                .replaceAll("\\s+", "");
+        }
+
+        /**
+         * Whether two normalized names are the same template with other arguments,
+         * such as `lib::Array<T>` and `lib::Array<cObj*>`. When one template name
+         * has no namespace (`Array<T>`), only the last segments are compared.
+         */
+        private static boolean sameTemplate(String a, String b) {
+            int left = a.indexOf('<');
+            int right = b.indexOf('<');
+            if (left <= 0 || right <= 0) {
+                return false;
+            }
+            String first = a.substring(0, left);
+            String second = b.substring(0, right);
+            if (!first.contains("::") || !second.contains("::")) {
+                first = first.substring(first.lastIndexOf(':') + 1);
+                second = second.substring(second.lastIndexOf(':') + 1);
+            }
+            return first.equals(second);
+        }
+
+        /**
+         * The base classes MSVC RTTI lists for each class, by normalized class
+         * name: the classes of the class's base class array after the class
+         * itself, with their offsets. Complete object locators are found in the
+         * program's loaded, non-executable memory by their signature and the
+         * reference to themselves that x64 RTTI carries. x86 RTTI carries none,
+         * so x86 programs have no RTTI here and use the name fallback.
+         */
+        private Map<String, List<RttiBase>> rtti() {
+            if (rttiClasses != null) {
+                return rttiClasses;
+            }
+            rttiClasses = new HashMap<>();
+            if (!x64) {
+                return rttiClasses;
+            }
+            DataValidationOptions options = new DataValidationOptions();
+            Map<Long, String> names = new HashMap<>();
+            for (MemoryBlock block : memory.getBlocks()) {
+                long start = rva(block.getStart());
+                if (!block.isInitialized() || !block.isLoaded() || block.isExecute() || start < 0
+                        || block.getSize() > Integer.MAX_VALUE) {
+                    continue;
+                }
+                byte[] bytes = new byte[(int) block.getSize()];
+                try {
+                    block.getBytes(block.getStart(), bytes);
+                } catch (MemoryAccessException e) {
+                    continue;
+                }
+                ByteBuffer data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+                for (int offset = 0; offset + 24 <= bytes.length; offset += 4) {
+                    // Signature 1 (x64), and pSelf at +20 holds the locator's own RVA.
+                    if (data.getInt(offset) != 1
+                            || Integer.toUnsignedLong(data.getInt(offset + 20)) != start + offset) {
+                        continue;
+                    }
+                    List<RttiBase> hierarchy =
+                        hierarchy(Integer.toUnsignedLong(data.getInt(offset + 16)), names, options);
+                    if (hierarchy != null && !hierarchy.isEmpty()) {
+                        rttiClasses.putIfAbsent(normalize(hierarchy.get(0).name()),
+                            hierarchy.subList(1, hierarchy.size()));
+                    }
+                }
+            }
+            return rttiClasses;
+        }
+
+        /**
+         * The classes of a class hierarchy descriptor's base class array, the
+         * class itself first, or null if it can't be read.
+         */
+        private List<RttiBase> hierarchy(long descriptor, Map<Long, String> names,
+                DataValidationOptions options) {
+            try {
+                Address hierarchy = imageBase.add(descriptor);
+                int count = memory.getInt(hierarchy.add(8));
+                if (count <= 0 || count > 4096) {
+                    return null;
+                }
+                Address array = imageBase.add(Integer.toUnsignedLong(memory.getInt(hierarchy.add(12))));
+                List<RttiBase> classes = new ArrayList<>();
+                for (int i = 0; i < count; i++) {
+                    Address base =
+                        imageBase.add(Integer.toUnsignedLong(memory.getInt(array.add(4L * i))));
+                    long typeDescriptor = Integer.toUnsignedLong(memory.getInt(base));
+                    String name = names.get(typeDescriptor);
+                    if (name == null) {
+                        name = className(typeDescriptor, options);
+                        if (name == null) {
+                            return null;
+                        }
+                        names.put(typeDescriptor, name);
+                    }
+                    // mdisp at +8; pdisp at +12 is -1 unless the base is virtual.
+                    classes.add(new RttiBase(name, memory.getInt(base.add(8)),
+                        memory.getInt(base.add(12)) >= 0));
+                }
+                return classes;
+            } catch (MemoryAccessException | AddressOutOfBoundsException e) {
+                return null;
+            }
+        }
+
+        /** A type descriptor's class name with its namespace path, demangled by Ghidra, or null. */
+        private String className(long typeDescriptor, DataValidationOptions options) {
+            try {
+                TypeDescriptorModel model =
+                    new TypeDescriptorModel(program, imageBase.add(typeDescriptor), options);
+                // The descriptor's "namespace" is the class's full path, the class included.
+                String path = model.getDescriptorTypeNamespace();
+                return path == null || path.isEmpty() ? model.getDescriptorName() : path;
+            } catch (Exception e) {
+                return null;
+            }
         }
 
         // -------------------------------------------------------------- helpers

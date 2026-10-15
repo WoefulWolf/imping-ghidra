@@ -11,7 +11,23 @@ Status: early development, not published. Supports x86 and x64 PE programs; test
 - **Types:** only those used by the exported functions and globals, directly or through other types.
 - **Identity:** the module's file name, image base, timestamp and image size from its PE header, and its SHA-256 when Ghidra recorded one.
 
-Name the functions and globals you want before exporting; a namespace or class in Ghidra becomes a namespace in the IR. Give a function the tag `imping-safe` when, with valid arguments, it is always fine to call and keeps none of its pointer arguments after returning: the generated bindings then let mods call it without `unsafe`.
+Name the functions and globals you want before exporting; a namespace or class in Ghidra becomes a namespace in the IR, and so does the `::` path in a data type's name (`Hw::cVec4` is the type `cVec4` in namespace `Hw`). Give a function the tag `imping-safe` when, with valid arguments, it is always fine to call and keeps none of its pointer arguments after returning: the generated bindings then let mods call it without `unsafe`.
+
+### Base classes
+
+A struct whose field at offset 0 is its base class gets that field marked as the base in the IR, and the generated bindings let it deref to the base and upcast pointers to it. The exporter decides which field that is:
+
+- **From RTTI**, for x64 programs built with MSVC: the exporter reads the program's run-time type information directly (Ghidra's RTTI analyzer need not have run). For a struct with exactly the name of a class RTTI describes, the struct field at offset 0 is the base when its type is the class's base at offset 0, or another of its bases at offset 0, whatever the field is called. Template names match without their arguments (`Array<T>` matches `lib::Array<cObj*>`).
+- **By name**, for structs RTTI doesn't describe (templates, classes without virtual functions, x86 programs): a struct field at offset 0 named `base`.
+
+Where RTTI contradicts a field named `base`, the field is not marked and the exporter prints a warning, for instance:
+
+```text
+imping: warning: RTTI lists Em8800Parts's base at offset 0 as BehaviorAppBase, but its field `base` there is a EmParts; not marked as a base.
+imping: warning: RTTI lists no base at offset 0 for Hw::cTextureBase, but its field `base` there is named like a base; not marked as a base.
+```
+
+Either means the struct or its name disagrees with the program: fix the field's type, rename the field, or rename the struct to the class RTTI names.
 
 ## Usage
 
