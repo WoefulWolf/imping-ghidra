@@ -11,7 +11,7 @@ Status: early development, not published. Supports x86 and x64 PE programs; test
 - **Types:** only those used by the exported functions and globals, directly or through other types.
 - **Identity:** the module's file name, image base, timestamp and image size from its PE header, and its SHA-256 when Ghidra recorded one.
 
-Name the functions and globals you want before exporting; a namespace or class in Ghidra becomes a namespace in the IR.
+Name the functions and globals you want before exporting; a namespace or class in Ghidra becomes a namespace in the IR. Give a function the tag `imping-safe` when, with valid arguments, it is always fine to call and keeps none of its pointer arguments after returning: the generated bindings then let mods call it without `unsafe`.
 
 ## Usage
 
