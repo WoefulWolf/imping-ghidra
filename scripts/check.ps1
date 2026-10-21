@@ -21,8 +21,8 @@ function Invoke-Step([string]$name, [scriptblock]$command) {
     }
 }
 
-# Every jar of Ghidra's framework and base features: enough to compile a script.
-$jars = Get-ChildItem -Recurse -Filter *.jar -Path "$env:GHIDRA_INSTALL_DIR\Ghidra\Framework", "$env:GHIDRA_INSTALL_DIR\Ghidra\Features\Base" |
+# Ghidra's framework and base features, plus MicrosoftCodeAnalyzer for the RTTI types.
+$jars = Get-ChildItem -Recurse -Filter *.jar -Path "$env:GHIDRA_INSTALL_DIR\Ghidra\Framework", "$env:GHIDRA_INSTALL_DIR\Ghidra\Features\Base", "$env:GHIDRA_INSTALL_DIR\Ghidra\Features\MicrosoftCodeAnalyzer" |
     ForEach-Object { $_.FullName }
 $classes = Join-Path ([System.IO.Path]::GetTempPath()) 'imping-ghidra-classes'
 Invoke-Step 'javac' { javac -d $classes -cp ($jars -join ';') '-Xlint:all,-path' -Werror ghidra_scripts\ImpingExport.java }
