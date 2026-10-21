@@ -50,7 +50,7 @@ imping check out\game.ir.json
 
 ## Development
 
-The checks need a Ghidra installation; set `GHIDRA_INSTALL_DIR` to it (the folder containing `support\analyzeHeadless.bat`). They compile the script against Ghidra's libraries, then run an end-to-end test: build the small Rust program in `tests/fixture`, analyse and export it with Ghidra's headless analyzer, check the IR against the program's own headers and bytes, and compile bindings generated from it against `imping-runtime`. The test depends on the sibling `imping-ir`, `imping-codegen` and `imping-runtime` repositories by relative path.
+The checks need a Ghidra installation; set `GHIDRA_INSTALL_DIR` to it (the folder containing `support\analyzeHeadless.bat`). They compile the script against Ghidra's libraries, then build the small Rust program in `tests/fixture`, export it with Ghidra's headless analyzer and check the IR against the program's own headers and bytes. The tests fetch `imping-ir` from GitHub, or use the local checkout inside a clone of the [imping](https://github.com/WoefulWolf/imping) repository.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/check.ps1

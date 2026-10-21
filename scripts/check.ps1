@@ -1,5 +1,5 @@
 ﻿# Compiles the exporter script against the installed Ghidra, then runs fmt, clippy
-# and the end-to-end test, which exports a fixture program with headless Ghidra.
+# and the tests, which export a fixture program with headless Ghidra.
 #
 # Usage, from the repo root: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
 # Needs GHIDRA_INSTALL_DIR set to a Ghidra install, e.g. D:\Programs\ghidra_12.1.2_PUBLIC.

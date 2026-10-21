@@ -1,6 +1,5 @@
-//! Exports the fixture program with `ImpingExport.java` in headless Ghidra, checks
-//! the IR against the executable, then compiles bindings generated from it
-//! against imping-runtime.
+//! Exports the fixture program with `ImpingExport.java` in headless Ghidra, once,
+//! and checks the IR against the executable.
 //!
 //! Needs `GHIDRA_INSTALL_DIR` set to a Ghidra installation. Takes a few minutes,
 //! since Ghidra analyses the whole program including its standard library.
@@ -8,6 +7,7 @@
 use imping_ir::{Architecture, Function, Ir, Module, Primitive, TypeDef, TypeId, TypeKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// Returns the imping-ghidra repository root.
 fn repo_root() -> PathBuf {
@@ -26,20 +26,21 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Runs a command, panicking with its output if it fails.
-fn run(command: &mut Command, what: &str) {
-    let output = command.output().unwrap_or_else(|e| panic!("{what}: {e}"));
-    if !output.status.success() {
-        panic!(
-            "{what} failed ({})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+/// Runs a command, returning its output as the error if it fails.
+fn run(command: &mut Command, what: &str) -> Result<(), String> {
+    let output = command.output().map_err(|e| format!("{what}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
     }
+    Err(format!(
+        "{what} failed ({})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
-/// The parts of a PE file the test checks the IR against.
+/// The parts of a PE file the tests check the IR against.
 struct Pe {
     bytes: Vec<u8>,
     image_base: u64,
@@ -96,6 +97,62 @@ impl Pe {
             .unwrap_or_else(|| panic!("RVA {rva:#x} is in no section"));
         let offset = (raw + (rva - va)) as usize;
         &self.bytes[offset..offset + len]
+    }
+}
+
+/// Builds the fixture, exports it with Ghidra and checks the IR is valid.
+fn build_and_export() -> Result<(Ir, Pe), String> {
+    let ghidra = PathBuf::from(
+        std::env::var_os("GHIDRA_INSTALL_DIR")
+            .ok_or("set GHIDRA_INSTALL_DIR to a Ghidra installation")?,
+    );
+    let root = repo_root();
+
+    // A debug build, so Ghidra gets the PDB with names and types.
+    let fixture_target = scratch("fixture-target");
+    run(
+        Command::new(env!("CARGO"))
+            .args(["build", "-p", "fixture", "--target-dir"])
+            .arg(&fixture_target)
+            .current_dir(&root),
+        "building the fixture",
+    )?;
+    let exe = fixture_target.join("debug").join("fixture.exe");
+
+    let project = scratch("ghidra-project");
+    let ir_path = project.join("fixture.ir.json");
+    run(
+        Command::new(ghidra.join("support").join("analyzeHeadless.bat"))
+            .arg(&project)
+            .arg("imping-e2e")
+            .arg("-import")
+            .arg(&exe)
+            .arg("-overwrite")
+            .arg("-scriptPath")
+            .arg(root.join("ghidra_scripts"))
+            .arg("-postScript")
+            .arg("ImpingExport.java")
+            .arg(&ir_path)
+            .arg("-deleteProject"),
+        "Ghidra's headless analyzer",
+    )?;
+
+    let text = std::fs::read_to_string(&ir_path).map_err(|e| format!("reading the IR: {e}"))?;
+    let ir = Ir::from_json_str(&text).map_err(|e| format!("parsing the IR: {e}"))?;
+    ir.validate()
+        .map_err(|e| format!("the IR is invalid: {e}"))?;
+    Ok((ir, Pe::read(&exe)))
+}
+
+/// Returns the exported IR's module and the executable, exporting on first use.
+fn exported() -> (&'static Module, &'static Pe) {
+    static EXPORT: OnceLock<Result<(Ir, Pe), String>> = OnceLock::new();
+    match EXPORT.get_or_init(build_and_export) {
+        Ok((ir, pe)) => {
+            assert_eq!(ir.modules.len(), 1);
+            (&ir.modules[0], pe)
+        }
+        Err(e) => panic!("{e}"),
     }
 }
 
@@ -156,86 +213,46 @@ fn function<'a>(module: &'a Module, name: &str) -> &'a Function {
 }
 
 #[test]
-fn exports_the_fixture_program() {
-    let ghidra = PathBuf::from(
-        std::env::var_os("GHIDRA_INSTALL_DIR")
-            .expect("set GHIDRA_INSTALL_DIR to a Ghidra installation"),
-    );
-    let root = repo_root();
-
-    // A debug build, so Ghidra gets the PDB with names and types.
-    let fixture_target = scratch("fixture-target");
-    run(
-        Command::new(env!("CARGO"))
-            .args(["build", "-p", "fixture", "--target-dir"])
-            .arg(&fixture_target)
-            .current_dir(&root),
-        "building the fixture",
-    );
-    let exe = fixture_target.join("debug").join("fixture.exe");
-
-    let project = scratch("ghidra-project");
-    let ir_path = project.join("fixture.ir.json");
-    run(
-        Command::new(ghidra.join("support").join("analyzeHeadless.bat"))
-            .arg(&project)
-            .arg("imping-e2e")
-            .arg("-import")
-            .arg(&exe)
-            .arg("-overwrite")
-            .arg("-scriptPath")
-            .arg(root.join("ghidra_scripts"))
-            .arg("-postScript")
-            .arg("ImpingExport.java")
-            .arg(&ir_path)
-            .arg("-deleteProject"),
-        "Ghidra's headless analyzer",
-    );
-
-    let text = std::fs::read_to_string(&ir_path).expect("the exporter wrote the IR");
-    let ir = Ir::from_json_str(&text).expect("the IR parses");
-    ir.validate().expect("the IR is valid");
-    assert_eq!(ir.modules.len(), 1);
-    let module = &ir.modules[0];
-    let pe = Pe::read(&exe);
+fn identity_matches_the_pe_header() {
+    let (module, pe) = exported();
     assert_eq!(module.name, "fixture.exe");
     assert_eq!(module.architecture, Architecture::X64);
     assert_eq!(module.image_base, pe.image_base);
     assert_eq!(module.timestamp, pe.timestamp);
     assert_eq!(module.image_size, pe.image_size);
-    println!(
-        "exported {} functions, {} globals and {} types",
-        module.functions.len(),
-        module.globals.len(),
-        module.types.len()
-    );
+}
 
-    assert!(
-        module.functions.iter().all(|f| !f.name.starts_with("FUN_")),
-        "functions with default names are not exported"
-    );
+#[test]
+fn skips_generated_names() {
+    let (module, _) = exported();
     let funclet = |name: &str| {
         ["Unwind@", "Catch@", "Catch_All@"]
             .iter()
             .any(|prefix| name.starts_with(prefix))
     };
-    assert!(
-        module.functions.iter().all(|f| !funclet(&f.name)),
-        "exception-handling funclets are not exported"
-    );
-    assert!(
-        module.globals.iter().all(|g| !g.name.starts_with("DAT_")),
-        "globals with default names are not exported"
-    );
     let generated = |name: &str| {
         name.starts_with("switchdataD_") || name.starts_with("RTTI_") || name == "vftable_meta_ptr"
     };
-    assert!(
-        module.globals.iter().all(|g| !generated(&g.name)),
-        "generated data labels are not exported"
-    );
+    for f in &module.functions {
+        assert!(
+            !f.name.starts_with("FUN_") && !funclet(&f.name),
+            "{}",
+            f.name
+        );
+    }
+    for g in &module.globals {
+        assert!(
+            !g.name.starts_with("DAT_") && !generated(&g.name),
+            "{}",
+            g.name
+        );
+    }
+}
 
-    // The program database places a crate's items in a namespace named after it.
+#[test]
+fn exports_function_signatures() {
+    let (module, pe) = exported();
+    // The program database puts a crate's items in a namespace named after it.
     let add = function(module, "fixture_add");
     assert_eq!(add.namespace, ["fixture"]);
     assert_eq!(add.parameters.len(), 2);
@@ -243,54 +260,51 @@ fn exports_the_fixture_program() {
         assert!(is_primitive(module, parameter.type_id, Primitive::I32));
     }
     assert!(is_primitive(module, add.return_type, Primitive::I32));
-    assert!(
-        !add.verification.is_empty(),
-        "fixture_add has verification bytes"
-    );
+    assert!(!add.verification.is_empty());
     assert_eq!(
         add.verification,
         pe.at(add.rva, add.verification.len()),
         "the RVA and verification bytes match the executable"
     );
 
+    let length = function(module, "fixture_length");
+    assert!(is_primitive(module, length.return_type, Primitive::F32));
+    let vector = pointee_struct(module, length.parameters[0].type_id);
+    assert!(vector.name.ends_with("Vector3"), "{}", vector.name);
+}
+
+#[test]
+fn exports_struct_layouts() {
+    let (module, _) = exported();
     let damage = function(module, "fixture_damage");
     assert_eq!(damage.parameters.len(), 2);
-    let entity = pointee_struct(module, damage.parameters[0].type_id);
-    assert!(entity.name.ends_with("Entity"), "{}", entity.name);
     assert!(is_primitive(
         module,
         damage.parameters[1].type_id,
         Primitive::F32
     ));
+
+    let entity = pointee_struct(module, damage.parameters[0].type_id);
+    assert!(entity.name.ends_with("Entity"), "{}", entity.name);
     let entity_fields = fields(entity);
     let names: Vec<&str> = entity_fields.iter().map(|(name, ..)| *name).collect();
     assert_eq!(names, ["kind", "position", "health"]);
     let (_, position, position_offset) = entity_fields[1];
     assert_eq!(position_offset, 4);
+
     let vector = peel(module, position);
     assert!(vector.name.ends_with("Vector3"), "{}", vector.name);
     let vector_fields = fields(vector);
-    assert_eq!(
-        vector_fields
-            .iter()
-            .map(|(name, ..)| *name)
-            .collect::<Vec<_>>(),
-        ["x", "y", "z"]
-    );
-    assert!(
-        vector_fields
-            .iter()
-            .all(|&(_, ty, _)| is_primitive(module, ty, Primitive::F32))
-    );
+    let names: Vec<&str> = vector_fields.iter().map(|(name, ..)| *name).collect();
+    assert_eq!(names, ["x", "y", "z"]);
+    for &(_, ty, _) in &vector_fields {
+        assert!(is_primitive(module, ty, Primitive::F32));
+    }
+}
 
-    let length = function(module, "fixture_length");
-    assert!(is_primitive(module, length.return_type, Primitive::F32));
-    assert!(
-        pointee_struct(module, length.parameters[0].type_id)
-            .name
-            .ends_with("Vector3")
-    );
-
+#[test]
+fn exports_globals() {
+    let (module, pe) = exported();
     let gravity = module
         .globals
         .iter()
@@ -298,38 +312,4 @@ fn exports_the_fixture_program() {
         .expect("fixture_gravity was exported");
     assert!(is_primitive(module, gravity.type_id, Primitive::F32));
     assert_eq!(pe.at(gravity.rva, 4), 9.81f32.to_le_bytes());
-
-    let bindings = imping_codegen::Generator::new()
-        .generate(&ir)
-        .expect("bindings generate");
-    println!("codegen warnings: {}", bindings.warnings().len());
-    let source = bindings.source();
-    assert!(source.contains("pub unsafe fn fixture_add("));
-    assert!(source.contains("pub static fixture_gravity:"));
-
-    let crate_dir = scratch("bindings-check");
-    let runtime = root.join("..").join("imping-runtime");
-    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
-    std::fs::write(
-        crate_dir.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"bindings-check\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
-             [dependencies]\nimping-runtime = {{ path = {:?} }}\n\n[workspace]\n",
-            runtime.display().to_string().replace('\\', "/")
-        ),
-    )
-    .unwrap();
-    std::fs::write(crate_dir.join("src").join("imped.rs"), source).unwrap();
-    std::fs::write(
-        crate_dir.join("src").join("lib.rs"),
-        "//! Bindings generated from the fixture program.\n\ninclude!(\"imped.rs\");\n",
-    )
-    .unwrap();
-    run(
-        Command::new(env!("CARGO"))
-            .args(["check", "--quiet"])
-            .env("RUSTFLAGS", "-D warnings")
-            .current_dir(&crate_dir),
-        "compiling the generated bindings",
-    );
 }
