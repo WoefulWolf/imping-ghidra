@@ -64,3 +64,5 @@ Licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+AI assistance was used for parts of this project.
