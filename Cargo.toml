@@ -8,6 +8,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
+authors = ["WoefulWolf"]
+repository = "https://github.com/WoefulWolf/imping-ghidra"
 publish = false
 
 [workspace.lints.rust]
