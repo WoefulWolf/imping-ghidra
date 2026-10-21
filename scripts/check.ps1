@@ -1,10 +1,8 @@
-﻿# Runs the checks: compiles the exporter script against the installed Ghidra,
-# then runs the end-to-end test, which exports a fixture program with Ghidra's
-# headless analyzer and checks the resulting IR and the bindings generated from it.
+﻿# Compiles the exporter script against the installed Ghidra, then runs fmt, clippy
+# and the end-to-end test, which exports a fixture program with headless Ghidra.
 #
 # Usage, from the repo root: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
-# GHIDRA_INSTALL_DIR must point at a Ghidra installation, for example
-# D:\Programs\ghidra_12.1.2_PUBLIC.
+# Needs GHIDRA_INSTALL_DIR set to a Ghidra install, e.g. D:\Programs\ghidra_12.1.2_PUBLIC.
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)

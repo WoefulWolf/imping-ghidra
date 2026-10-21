@@ -1,15 +1,15 @@
-//! Builds the fixture program, exports it with Ghidra's headless analyzer and
-//! `ImpingExport.java`, checks the IR against the program itself, then
-//! generates bindings from the IR and compiles them against imping-runtime.
+//! Exports the fixture program with `ImpingExport.java` in headless Ghidra, checks
+//! the IR against the executable, then compiles bindings generated from it
+//! against imping-runtime.
 //!
-//! Needs `GHIDRA_INSTALL_DIR` to point at a Ghidra installation. Takes a few
-//! minutes: Ghidra analyses the whole program, including its standard library.
+//! Needs `GHIDRA_INSTALL_DIR` set to a Ghidra installation. Takes a few minutes,
+//! since Ghidra analyses the whole program including its standard library.
 
 use imping_ir::{Architecture, Function, Ir, Module, Primitive, TypeDef, TypeId, TypeKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The imping-ghidra repository root.
+/// Returns the imping-ghidra repository root.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -18,7 +18,7 @@ fn repo_root() -> PathBuf {
         .to_owned()
 }
 
-/// A fresh scratch directory.
+/// Returns an empty scratch directory, clearing out any previous run's.
 fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -86,7 +86,7 @@ impl Pe {
         }
     }
 
-    /// The file bytes at an RVA.
+    /// Returns the file bytes at an RVA.
     fn at(&self, rva: u32, len: usize) -> &[u8] {
         let (va, _, raw, _) = self
             .sections
@@ -107,7 +107,7 @@ fn type_def(module: &Module, id: TypeId) -> &TypeDef {
         .unwrap_or_else(|| panic!("type id {} is defined", id.0))
 }
 
-/// A type through typedefs.
+/// Resolves a type through typedefs.
 fn peel(module: &Module, mut id: TypeId) -> &TypeDef {
     loop {
         let def = type_def(module, id);
@@ -122,7 +122,7 @@ fn is_primitive(module: &Module, id: TypeId, primitive: Primitive) -> bool {
     matches!(peel(module, id).kind, TypeKind::Primitive { primitive: p } if p == primitive)
 }
 
-/// The struct a pointer type points to.
+/// Returns the struct a pointer type points to.
 fn pointee_struct(module: &Module, id: TypeId) -> &TypeDef {
     let TypeKind::Pointer { pointee, .. } = peel(module, id).kind else {
         panic!("type {} is not a pointer", type_def(module, id).name);
@@ -136,7 +136,7 @@ fn pointee_struct(module: &Module, id: TypeId) -> &TypeDef {
     def
 }
 
-/// The (name, type) fields of a struct.
+/// Returns a struct's fields as (name, type, offset).
 fn fields(def: &TypeDef) -> Vec<(&str, TypeId, u64)> {
     let TypeKind::Struct { fields, .. } = &def.kind else {
         panic!("{} is not a struct", def.name);
@@ -163,7 +163,7 @@ fn exports_the_fixture_program() {
     );
     let root = repo_root();
 
-    // 1. Build the fixture program, with its program database.
+    // A debug build, so Ghidra gets the PDB with names and types.
     let fixture_target = scratch("fixture-target");
     run(
         Command::new(env!("CARGO"))
@@ -174,7 +174,6 @@ fn exports_the_fixture_program() {
     );
     let exe = fixture_target.join("debug").join("fixture.exe");
 
-    // 2. Analyse it headless and export it.
     let project = scratch("ghidra-project");
     let ir_path = project.join("fixture.ir.json");
     run(
@@ -193,7 +192,6 @@ fn exports_the_fixture_program() {
         "Ghidra's headless analyzer",
     );
 
-    // 3. Check the IR against the program.
     let text = std::fs::read_to_string(&ir_path).expect("the exporter wrote the IR");
     let ir = Ir::from_json_str(&text).expect("the IR parses");
     ir.validate().expect("the IR is valid");
@@ -301,7 +299,6 @@ fn exports_the_fixture_program() {
     assert!(is_primitive(module, gravity.type_id, Primitive::F32));
     assert_eq!(pe.at(gravity.rva, 4), 9.81f32.to_le_bytes());
 
-    // 4. Generate bindings and compile them against imping-runtime.
     let bindings = imping_codegen::Generator::new()
         .generate(&ir)
         .expect("bindings generate");

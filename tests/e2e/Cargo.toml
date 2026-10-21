@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dev-dependencies]
-# Sibling suite repos, by relative path during development.
+# Sibling imping repos, by relative path.
 imping-ir = { path = "../../../imping-ir" }
 imping-codegen = { path = "../../../imping-codegen/crates/imping-codegen" }
 

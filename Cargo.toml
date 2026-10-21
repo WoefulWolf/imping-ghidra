@@ -1,5 +1,4 @@
-# Rust crates used only to test the exporter: a fixture program and the
-# end-to-end test that exports it with Ghidra.
+# Test-only crates: a fixture program and the end-to-end test that exports it with Ghidra.
 [workspace]
 resolver = "3"
 members = ["tests/fixture", "tests/e2e"]

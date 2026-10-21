@@ -42,7 +42,7 @@ pub struct Entity {
     pub health: f32,
 }
 
-/// Gravity, read and written through the exported global.
+/// Gravity, a global the test expects in the IR.
 #[unsafe(no_mangle)]
 pub static mut fixture_gravity: f32 = 9.81;
 
@@ -53,7 +53,7 @@ pub extern "C" fn fixture_add(a: i32, b: i32) -> i32 {
     black_box(a).wrapping_add(black_box(b))
 }
 
-/// The length of a vector.
+/// Returns the length of a vector.
 ///
 /// # Safety
 ///

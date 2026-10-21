@@ -1,31 +1,18 @@
 // Exports the current program as an imping IR file (JSON): its build identity,
-// every function and global with a non-default name, and the types they use.
+// the functions and globals with non-default names, and the types they use.
 //
-// Exported functions are the non-external functions whose names are not Ghidra
-// defaults (not FUN_...), except the exception-handling funclets Ghidra's
-// analysis names (Unwind@..., Catch@...). Exported globals are the data
-// labels a user or a symbol source named: not defaults (DAT_..., PTR_...,
-// s_...), not names Ghidra's analysis generated (switchdataD_...), and not
-// RTTI metadata (RTTI_..., vftable_meta_ptr); vftable labels are kept. Types
-// are exported only when an exported function or global uses them, directly
-// or through other types.
+// Names Ghidra generated (FUN_..., DAT_..., Unwind@..., switchdataD_..., RTTI
+// labels) are skipped. A struct's field at offset 0 is marked as its base class
+// when x64 RTTI says so, or else when the field is named `base`.
 //
-// A struct's field at offset 0 is marked as its base class from the program's
-// MSVC RTTI (x64) when RTTI describes a class of exactly the struct's name: the
-// field is the base when its type is the class's first base, or another base
-// RTTI places at offset 0 (template names compare without their arguments).
-// Where RTTI contradicts a field named `base`, the field is not marked and a
-// warning says why. A struct RTTI does not describe falls back to its name: a
-// struct field at offset 0 named `base` is the base.
-//
-// In the GUI, the script asks where to save the file. Headless, pass the output
+// In the GUI the script asks where to save the file. Headless, pass the output
 // path as the script's argument:
 //
 //   analyzeHeadless <project dir> <project> -process <program> -noanalysis
 //       -scriptPath <imping-ghidra>/ghidra_scripts
 //       -postScript ImpingExport.java <output.ir.json>
 //
-// Only x86 and x64 PE programs are supported.
+// Supports x86 and x64 PE programs only.
 //@category imping
 
 import com.google.gson.stream.JsonWriter;
@@ -127,7 +114,7 @@ public class ImpingExport extends GhidraScript {
             exporter.functions.size(), exporter.globals.size(), exporter.types.size(), output));
     }
 
-    /** The output file: the script argument when headless, otherwise asked for. */
+    /** Returns the output file: the script's argument, or else one the user picks. */
     private File outputFile() throws Exception {
         String[] args = getScriptArgs();
         if (args.length > 0) {
@@ -152,7 +139,7 @@ public class ImpingExport extends GhidraScript {
         void write(JsonWriter json) throws IOException;
     }
 
-    /** One base class RTTI lists for a class: its name and offset in the class. */
+    /** One base class RTTI lists for a class: its name, offset and whether it's virtual. */
     private record RttiBase(String name, int offset, boolean isVirtual) {}
 
     /** One field of a struct or union, resolved to type ids. */
@@ -230,7 +217,7 @@ public class ImpingExport extends GhidraScript {
                 }
             }
             globals.sort((a, b) -> a.symbol().getAddress().compareTo(b.symbol().getAddress()));
-            // Assign type ids in a deterministic order: functions, then globals.
+            // Functions first, then globals, so type ids come out the same every run.
             for (Function function : functions) {
                 typeId(function.getReturnType());
                 for (Parameter parameter : parameters(function)) {
@@ -351,8 +338,8 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * Writes a parameter's storage. Returns false if it is not a single
-         * register or stack slot, so the function needs custom storage.
+         * Writes a parameter's storage, returning false if it isn't a single register or
+         * stack slot (the function then needs custom storage).
          */
         private boolean writeStorage(JsonWriter json, VariableStorage storage) throws IOException {
             json.beginObject();
@@ -385,10 +372,10 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * Splits a C++ name at its top-level `::` into namespace segments and the
-         * name: `Hw::cVec4` is `[Hw, cVec4]`, and `lib::Array<hap::Token>` is
-         * `[lib, Array<hap::Token>]`, since template arguments (and parameter
-         * lists inside them) are kept whole. A name without `::` is one segment.
+         * Splits a C++ name at its top-level {@code ::} into namespace segments and the name.
+         *
+         * <p>Template arguments and parenthesised lists stay whole, so
+         * {@code lib::Array<hap::Token>} splits into {@code [lib, Array<hap::Token>]}.
          */
         private static List<String> splitPath(String name) {
             List<String> segments = new ArrayList<>();
@@ -433,7 +420,7 @@ public class ImpingExport extends GhidraScript {
 
         // ----------------------------------------------------------- identity
 
-        /** The module's file name, as the process loads it. */
+        /** Returns the module's file name, as the process loads it. */
         private String moduleName() {
             String path = program.getExecutablePath();
             if (path != null && !path.isEmpty()) {
@@ -445,7 +432,7 @@ public class ImpingExport extends GhidraScript {
             return program.getName();
         }
 
-        /** The address of the PE NT headers, which Ghidra maps at the image base. */
+        /** Returns the PE NT headers' address, via the headers Ghidra maps at the image base. */
         private Address ntHeaders() throws MemoryAccessException {
             if (memory.getShort(imageBase) != 0x5a4d) {
                 throw new IllegalStateException(
@@ -461,10 +448,10 @@ public class ImpingExport extends GhidraScript {
         // ---------------------------------------------------------- functions
 
         /**
-         * Whether a function is an exception-handling funclet that Ghidra's
-         * analysis named (Unwind@..., Catch@..., Catch_All@...). Such names are
-         * not defaults, but the funclets are compiler-generated pieces of other
-         * functions, not functions to call or hook. A name a user chose is kept.
+         * Returns whether a function is an exception-handling funclet named by Ghidra's analysis.
+         *
+         * <p>Funclets (Unwind@..., Catch@..., Catch_All@...) are compiler-generated pieces of
+         * other functions, not something to call or hook. A name a user chose is still exported.
          */
         private boolean isExceptionFunclet(Function function) {
             return function.getSymbol().getSource() == SourceType.ANALYSIS
@@ -472,18 +459,18 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * Whether a data label was generated rather than chosen: any label
-         * Ghidra's analysis named (switch tables such as switchdataD_...,
-         * thread-block fields), and the RTTI metadata labels its class
-         * recovery creates (RTTI_... descriptors, vftable_meta_ptr). Labels of
-         * virtual function tables (vftable) are kept.
+         * Returns whether a data label was generated rather than chosen.
+         *
+         * <p>That's any label from Ghidra's analysis (switchdataD_..., thread-block fields)
+         * and the RTTI metadata labels from class recovery (RTTI_..., vftable_meta_ptr).
+         * vftable labels are kept.
          */
         private boolean isGeneratedDataLabel(Symbol symbol) {
             return symbol.getSource() == SourceType.ANALYSIS
                 || RTTI_METADATA.matcher(symbol.getName()).matches();
         }
 
-        /** A function's parameters, without a hidden return-storage pointer. */
+        /** Returns a function's parameters, without a hidden return-storage pointer. */
         private List<Parameter> parameters(Function function) {
             List<Parameter> parameters = new ArrayList<>();
             for (Parameter parameter : function.getParameters()) {
@@ -514,7 +501,7 @@ public class ImpingExport extends GhidraScript {
             }
         }
 
-        /** A register name in lowercase, without Ghidra's sub-register suffix (XMM1_Qa). */
+        /** Lowercases a register name and drops Ghidra's sub-register suffix (XMM1_Qa). */
         private String registerName(String name) {
             String lower = name.toLowerCase();
             if (lower.startsWith("xmm") || lower.startsWith("ymm")) {
@@ -527,8 +514,8 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * The first bytes of a function as hex, stopping at the end of its first
-         * address range and at the first byte the loader relocates.
+         * Returns a function's first bytes as hex, stopping at the end of its first address
+         * range or at the first byte the loader relocates.
          */
         private String verification(Function function) {
             Address entry = function.getEntryPoint();
@@ -562,15 +549,14 @@ public class ImpingExport extends GhidraScript {
 
         // -------------------------------------------------------------- types
 
-        /** The type id for a global's data, sizing variable-length data such as strings. */
+        /** Returns the type id of a global's data, sizing variable-length data such as strings. */
         private int globalType(Data data) {
             DataType type = data.getDataType();
             if (type.getLength() > 0 || data.getLength() <= 0) {
                 return typeId(type);
             }
-            // A variable-length type, such as a string: an array of its
-            // characters, using Ghidra's character types so the array is
-            // recognised as text.
+            // Variable length, like a string: an array of Ghidra's character types,
+            // so it's still recognised as text.
             String name = type.getName().toLowerCase();
             DataType element = name.contains("unicode32") ? WideChar32DataType.dataType
                 : name.contains("unicode") ? WideChar16DataType.dataType
@@ -586,7 +572,7 @@ public class ImpingExport extends GhidraScript {
             });
         }
 
-        /** The id of a Ghidra data type, adding it (and the types it uses) on first use. */
+        /** Returns the id of a Ghidra data type, adding it and the types it uses on first use. */
         int typeId(DataType type) {
             if (type == null) {
                 type = VoidDataType.dataType;
@@ -604,16 +590,18 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * Whether a type becomes a named item in generated code (struct, union,
-         * enum or typedef), so that a namespace path in its name is meaningful.
-         * Pointers, arrays and built-ins are named after what they point to or hold.
+         * Returns whether a type is a struct, union, enum or typedef, whose name can hold a
+         * namespace path.
+         *
+         * <p>Pointers, arrays and built-ins are named after what they point to or hold, so
+         * their names aren't split.
          */
         private static boolean isNamedItem(DataType type) {
             return type instanceof Structure || type instanceof Union || type instanceof Enum
                 || type instanceof TypeDef;
         }
 
-        /** The id of a synthesised type, adding it on first use. */
+        /** Returns the id of a synthesised type, adding it on first use. */
         private int synthetic(String key, String name, TypeBody body) {
             Integer existing = typeIds.get(key);
             if (existing != null) {
@@ -632,7 +620,7 @@ public class ImpingExport extends GhidraScript {
             return id;
         }
 
-        /** The id of an IR primitive. */
+        /** Returns the id of an IR primitive, adding it on first use. */
         private int primitive(String primitive) {
             return synthetic("imping:primitive:" + primitive, primitive, json -> {
                 json.name("kind").value("primitive");
@@ -656,7 +644,7 @@ public class ImpingExport extends GhidraScript {
             };
         }
 
-        /** The IR integer primitive of a size and signedness, if there is one. */
+        /** Returns the IR integer primitive of a size and signedness, or null if there's none. */
         private String integer(int size, boolean signed) {
             switch (size) {
                 case 1:
@@ -818,9 +806,11 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * A composite's fields. Ghidra places a bitfield at the bytes it spans;
-         * the IR places it in a storage unit of its declared type, aligned to
-         * that type's size, so the bitfields sharing a unit share an offset.
+         * Converts a composite's components to IR fields.
+         *
+         * <p>Ghidra places a bitfield at the bytes it spans; the IR places it in a storage
+         * unit of its declared type, aligned to that type's size, so bitfields sharing a
+         * unit share an offset.
          */
         private List<FieldEntry> fields(DataTypeComponent[] components, DataTypeComponent baseField) {
             List<FieldEntry> fields = new ArrayList<>();
@@ -857,13 +847,13 @@ public class ImpingExport extends GhidraScript {
         // --------------------------------------------------------- base classes
 
         /**
-         * The field to mark as a struct's base class, or null. Where RTTI
-         * describes a class of exactly the struct's name, the struct field at
-         * offset 0 is the base when its type is a base RTTI places at offset 0
-         * (template names compare without their arguments), whatever the field
-         * is called; a field named {@code base} that RTTI contradicts is not
-         * marked, and a warning says why. Otherwise a struct field at offset 0
-         * named {@code base} is the base.
+         * Returns the field to mark as a struct's base class, or null.
+         *
+         * <p>If RTTI describes a class of the struct's exact name, the struct field at offset 0,
+         * whatever its name, is the base when RTTI puts its type at offset 0 as a non-virtual
+         * base (templates compare without arguments); a {@code base} field RTTI contradicts
+         * gets a warning instead. Without such RTTI, a struct field at offset 0 named
+         * {@code base} is the base.
          */
         private DataTypeComponent baseComponent(Structure structure) {
             DataTypeComponent first = null;
@@ -909,15 +899,15 @@ public class ImpingExport extends GhidraScript {
             return null;
         }
 
-        /** The structure a type is, through typedefs, or null. */
+        /** Returns the structure a type is, looking through typedefs, or null. */
         private static Structure asStructure(DataType type) {
             DataType resolved = type instanceof TypeDef typedef ? typedef.getBaseDataType() : type;
             return resolved instanceof Structure structure ? structure : null;
         }
 
         /**
-         * A C++ type name in one spelling: without `class`, `struct`, `union` or
-         * `enum` keywords, `__ptr64` or whitespace.
+         * Normalizes a C++ type name by dropping class, struct, union and enum keywords,
+         * {@code __ptr64} and whitespace.
          */
         private static String normalize(String name) {
             return name.replaceAll("\\b(class|struct|union|enum)\\s+", "")
@@ -926,9 +916,10 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * Whether two normalized names are the same template with other arguments,
-         * such as `lib::Array<T>` and `lib::Array<cObj*>`. When one template name
-         * has no namespace (`Array<T>`), only the last segments are compared.
+         * Returns whether two normalized names are the same template, such as
+         * {@code lib::Array<T>} and {@code lib::Array<cObj*>}.
+         *
+         * <p>If either has no namespace ({@code Array<T>}), only the last segments are compared.
          */
         private static boolean sameTemplate(String a, String b) {
             int left = a.indexOf('<');
@@ -946,12 +937,11 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * The base classes MSVC RTTI lists for each class, by normalized class
-         * name: the classes of the class's base class array after the class
-         * itself, with their offsets. Complete object locators are found in the
-         * program's loaded, non-executable memory by their signature and the
-         * reference to themselves that x64 RTTI carries. x86 RTTI carries none,
-         * so x86 programs have no RTTI here and use the name fallback.
+         * Returns the base classes MSVC RTTI lists for each class, by normalized class name.
+         *
+         * <p>Finds complete object locators in loaded, non-executable memory by their signature
+         * and the self-reference x64 RTTI carries. x86 locators have none, so x86 programs get
+         * an empty map and fall back to field names.
          */
         private Map<String, List<RttiBase>> rtti() {
             if (rttiClasses != null) {
@@ -994,8 +984,8 @@ public class ImpingExport extends GhidraScript {
         }
 
         /**
-         * The classes of a class hierarchy descriptor's base class array, the
-         * class itself first, or null if it can't be read.
+         * Returns the classes in a class hierarchy descriptor's base class array, the class
+         * itself first, or null if it can't be read.
          */
         private List<RttiBase> hierarchy(long descriptor, Map<Long, String> names,
                 DataValidationOptions options) {
@@ -1029,7 +1019,7 @@ public class ImpingExport extends GhidraScript {
             }
         }
 
-        /** A type descriptor's class name with its namespace path, demangled by Ghidra, or null. */
+        /** Returns a type descriptor's demangled class name with its namespace path, or null. */
         private String className(long typeDescriptor, DataValidationOptions options) {
             try {
                 TypeDescriptorModel model =
@@ -1049,7 +1039,7 @@ public class ImpingExport extends GhidraScript {
             return block != null && block.isLoaded();
         }
 
-        /** The address relative to the image base, or -1 if it isn't a 32-bit RVA. */
+        /** Returns an address relative to the image base, or -1 if that isn't a 32-bit RVA. */
         private long rva(Address address) {
             long rva = address.getOffset() - imageBase.getOffset();
             return rva >= 0 && rva <= 0xffff_ffffL ? rva : -1;
