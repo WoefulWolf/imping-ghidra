@@ -53,6 +53,13 @@ pub extern "C" fn fixture_add(a: i32, b: i32) -> i32 {
     black_box(a).wrapping_add(black_box(b))
 }
 
+/// Moves a byte by a signed offset, saturating.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn fixture_nudge(value: u8, offset: i8) -> u8 {
+    black_box(value).saturating_add_signed(black_box(offset))
+}
+
 /// Returns the length of a vector.
 ///
 /// # Safety
@@ -95,8 +102,9 @@ fn main() {
     // SAFETY: Single-threaded access to the global.
     let gravity = unsafe { black_box(fixture_gravity) };
     println!(
-        "{} {length} {gravity} {:?}",
+        "{} {} {length} {gravity} {:?}",
         fixture_add(2, 3),
+        fixture_nudge(200, -8),
         black_box(entity)
     );
 }

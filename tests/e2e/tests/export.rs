@@ -274,6 +274,24 @@ fn exports_function_signatures() {
 }
 
 #[test]
+fn keeps_byte_signedness() {
+    let (module, _) = exported();
+    // The program database gives u8 as unsigned char and i8 as signed char.
+    let nudge = function(module, "fixture_nudge");
+    assert!(is_primitive(
+        module,
+        nudge.parameters[0].type_id,
+        Primitive::U8
+    ));
+    assert!(is_primitive(
+        module,
+        nudge.parameters[1].type_id,
+        Primitive::I8
+    ));
+    assert!(is_primitive(module, nudge.return_type, Primitive::U8));
+}
+
+#[test]
 fn exports_struct_layouts() {
     let (module, _) = exported();
     let damage = function(module, "fixture_damage");

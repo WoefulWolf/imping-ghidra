@@ -759,8 +759,9 @@ public class ImpingExport extends GhidraScript {
                 int size = type.getLength();
                 return size == 4 ? primitiveBody("f32") : size == 8 ? primitiveBody("f64") : opaqueBody(size);
             }
-            if (type instanceof CharDataType && type.getLength() == 1) {
-                return primitiveBody("i8");
+            // uchar and schar are CharDataTypes too; plain char is signed in MSVC's data layout.
+            if (type instanceof CharDataType character && type.getLength() == 1) {
+                return primitiveBody(character.isSigned() ? "i8" : "u8");
             }
             if (type instanceof WideCharDataType || type instanceof WideChar16DataType) {
                 return primitiveBody("u16");
