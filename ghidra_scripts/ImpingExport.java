@@ -3,7 +3,8 @@
 //
 // Names Ghidra generated (FUN_..., DAT_..., Unwind@..., switchdataD_..., RTTI
 // labels) are skipped. A struct's field at offset 0 is marked as its base class
-// when x64 RTTI says so, or else when the field is named `base`.
+// when x64 RTTI says so, or else when the field is named `base`. Each function
+// also gets a byte pattern that finds it if a later build moves it.
 //
 // In the GUI the script asks where to save the file. Headless, pass the output
 // path as the script's argument:
@@ -44,10 +45,15 @@ import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.data.WideChar16DataType;
 import ghidra.program.model.data.WideChar32DataType;
 import ghidra.program.model.data.WideCharDataType;
+import ghidra.program.model.lang.InstructionPrototype;
+import ghidra.program.model.lang.Mask;
+import ghidra.program.model.lang.OperandType;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.AutoParameterType;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionTag;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.listing.Program;
@@ -58,6 +64,8 @@ import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.reloc.Relocation;
 import ghidra.program.model.symbol.Namespace;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
@@ -70,6 +78,8 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -82,10 +92,19 @@ public class ImpingExport extends GhidraScript {
 
     /** The IR format version this script writes. */
     private static final int FORMAT_MAJOR = 1;
-    private static final int FORMAT_MINOR = 1;
+    private static final int FORMAT_MINOR = 2;
 
     /** The most bytes recorded to verify a function's start before hooking it. */
     private static final int VERIFICATION_BYTES = 16;
+
+    /** The longest byte pattern, in bytes. */
+    private static final int PATTERN_BYTES = 64;
+
+    /** The most calls tried for a function whose own bytes aren't unique. */
+    private static final int PATTERN_CALL_SITES = 10;
+
+    /** The most instructions before a call that a pattern may start at. */
+    private static final int PATTERN_LEAD = 3;
 
     /** Names Ghidra's analysis gives exception-handling funclets. */
     private static final Pattern EXCEPTION_FUNCLET =
@@ -110,8 +129,10 @@ public class ImpingExport extends GhidraScript {
         for (String warning : exporter.warnings) {
             println("imping: warning: " + warning);
         }
-        println(String.format("imping: exported %d functions, %d globals and %d types to %s",
-            exporter.functions.size(), exporter.globals.size(), exporter.types.size(), output));
+        println(String.format(
+            "imping: exported %d functions (%d with byte patterns), %d globals and %d types to %s",
+            exporter.functions.size(), exporter.patterns.size(), exporter.globals.size(),
+            exporter.types.size(), output));
     }
 
     /** Returns the output file: the script's argument, or else one the user picks. */
@@ -150,6 +171,66 @@ public class ImpingExport extends GhidraScript {
         }
     }
 
+    /**
+     * A byte pattern that matches one function alone: its bytes, which of them are fixed, and
+     * whether it matches a call to the function, `offset` bytes in, rather than the function
+     * itself.
+     */
+    private record BytePattern(byte[] bytes, boolean[] fixed, int length, int offset,
+            boolean followCall) {
+        /** Returns the pattern as imping reads it, e.g. `48 8b ?? 57`, minus trailing wildcards. */
+        String text() {
+            int end = length;
+            while (end > 0 && !fixed[end - 1]) {
+                end--;
+            }
+            StringBuilder text = new StringBuilder(end * 3);
+            for (int i = 0; i < end; i++) {
+                if (i > 0) {
+                    text.append(' ');
+                }
+                text.append(fixed[i] ? String.format("%02x", bytes[i] & 0xff) : "??");
+            }
+            return text.toString();
+        }
+    }
+
+    /**
+     * Instructions read for a pattern: their bytes, which of them are fixed, where each
+     * instruction ends, and where the call is if it's read for a call to the function.
+     */
+    private record Sequence(Address start, byte[] bytes, boolean[] fixed, int[] ends,
+            boolean followCall, int callAt) {
+        /** Returns how far a pattern must reach: past the call's displacement, if there's one. */
+        int minimum() {
+            return followCall ? callAt + 5 : 0;
+        }
+
+        /** Returns where the first three fixed bytes in a row start, or -1. */
+        int anchor() {
+            int length = ends[ends.length - 1];
+            for (int i = 0; i + 3 <= length; i++) {
+                if (fixed[i] && fixed[i + 1] && fixed[i + 2]) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+    }
+
+    /** A growable list of longs. */
+    private static final class LongList {
+        long[] items = new long[16];
+        int size;
+
+        void add(long item) {
+            if (size == items.length) {
+                items = Arrays.copyOf(items, size * 2);
+            }
+            items[size++] = item;
+        }
+    }
+
     /** Collects what to export from a program and writes it as IR. */
     private final class Exporter {
         private final Program program;
@@ -161,6 +242,7 @@ public class ImpingExport extends GhidraScript {
         final List<Function> functions = new ArrayList<>();
         final List<GlobalItem> globals = new ArrayList<>();
         final List<TypeEntry> types = new ArrayList<>();
+        final Map<Function, BytePattern> patterns = new HashMap<>();
         /** Contradictions found while exporting, for the user to check. */
         final List<String> warnings = new ArrayList<>();
         private final Map<String, Integer> typeIds = new HashMap<>();
@@ -226,6 +308,22 @@ public class ImpingExport extends GhidraScript {
             }
             for (GlobalItem global : globals) {
                 globalType(global.data());
+            }
+            patterns.putAll(new PatternMaker(program).find(functions));
+            List<String> unmatched = new ArrayList<>();
+            for (Function function : functions) {
+                if (!patterns.containsKey(function)) {
+                    unmatched.add(function.getName(true));
+                }
+            }
+            if (!unmatched.isEmpty()) {
+                // Often thousands, mostly tiny or identical functions, so only a few are named.
+                int named = Math.min(unmatched.size(), 10);
+                String rest = unmatched.size() > named
+                    ? " and " + (unmatched.size() - named) + " more" : "";
+                warnings.add("no unique byte pattern for " + unmatched.size()
+                    + " functions, so they can't be found if they move (mostly tiny or identical"
+                    + " ones): " + String.join(", ", unmatched.subList(0, named)) + rest);
             }
         }
 
@@ -333,6 +431,18 @@ public class ImpingExport extends GhidraScript {
             String verification = verification(function);
             if (!verification.isEmpty()) {
                 json.name("verification").value(verification);
+            }
+            BytePattern pattern = patterns.get(function);
+            if (pattern != null) {
+                json.name("pattern").beginObject();
+                json.name("bytes").value(pattern.text());
+                if (pattern.offset() != 0) {
+                    json.name("offset").value(pattern.offset());
+                }
+                if (pattern.followCall()) {
+                    json.name("follow_call").value(true);
+                }
+                json.endObject();
             }
             json.endObject();
         }
@@ -1048,6 +1158,330 @@ public class ImpingExport extends GhidraScript {
 
         private String hex(long value) {
             return "0x" + Long.toHexString(value);
+        }
+    }
+
+    /**
+     * Finds a byte pattern for each function that matches it once among the program's executable
+     * bytes, as imping's runtime searches them. A pattern grows an instruction at a time from the
+     * entry, within the function; if the function ends first, it grows from a call to the function
+     * instead. Bytes that hold addresses are wildcards, so code that moved still matches.
+     */
+    private final class PatternMaker {
+        private final Program program;
+        private final Listing listing;
+        private final List<MemoryBlock> blocks = new ArrayList<>();
+        private final List<byte[]> contents = new ArrayList<>();
+        /** Where each wanted 3-byte anchor occurs, as {@link #pack}ed positions. */
+        private final Map<Integer, LongList> anchors = new HashMap<>();
+        private long[] candidates = new long[1024];
+
+        PatternMaker(Program program) throws MemoryAccessException {
+            this.program = program;
+            this.listing = program.getListing();
+            for (MemoryBlock block : program.getMemory().getBlocks()) {
+                if (block.isExecute() && block.isInitialized() && block.isLoaded()) {
+                    byte[] bytes = new byte[(int) block.getSize()];
+                    block.getBytes(block.getStart(), bytes);
+                    blocks.add(block);
+                    contents.add(bytes);
+                }
+            }
+        }
+
+        Map<Function, BytePattern> find(List<Function> functions) throws Exception {
+            monitor.setMessage("imping: finding byte patterns");
+            Map<Function, BytePattern> found = new HashMap<>();
+            Map<Function, Sequence> entries = new HashMap<>();
+            for (Function function : functions) {
+                monitor.checkCancelled();
+                Address entry = function.getEntryPoint();
+                AddressRange range = function.getBody().getRangeContaining(entry);
+                Instruction first = listing.getInstructionAt(entry);
+                Sequence sequence =
+                    range == null || first == null ? null : sequence(first, range, false, 0);
+                if (sequence != null) {
+                    entries.put(function, sequence);
+                }
+            }
+            index(entries.values());
+            List<Function> pending = new ArrayList<>();
+            for (Function function : functions) {
+                monitor.checkCancelled();
+                Sequence sequence = entries.get(function);
+                BytePattern pattern = sequence == null ? null : unique(sequence);
+                if (pattern != null) {
+                    found.put(function, pattern);
+                } else {
+                    pending.add(function);
+                }
+            }
+
+            Map<Function, List<Sequence>> calls = new HashMap<>();
+            List<Sequence> all = new ArrayList<>();
+            for (Function function : pending) {
+                monitor.checkCancelled();
+                List<Sequence> sequences = callSequences(function);
+                calls.put(function, sequences);
+                all.addAll(sequences);
+            }
+            index(all);
+            for (Function function : pending) {
+                monitor.checkCancelled();
+                BytePattern best = null;
+                for (Sequence sequence : calls.get(function)) {
+                    BytePattern pattern = unique(sequence);
+                    if (pattern != null && (best == null || pattern.length() < best.length())) {
+                        best = pattern;
+                    }
+                }
+                if (best != null) {
+                    found.put(function, best);
+                }
+            }
+            return found;
+        }
+
+        /**
+         * Returns sequences around direct calls or jumps to a function from inside others: from
+         * the call, and from each of the few instructions before it.
+         */
+        private List<Sequence> callSequences(Function function) {
+            List<Sequence> sequences = new ArrayList<>();
+            ReferenceIterator references =
+                program.getReferenceManager().getReferencesTo(function.getEntryPoint());
+            int calls = 0;
+            while (references.hasNext() && calls < PATTERN_CALL_SITES) {
+                Address from = references.next().getFromAddress();
+                Instruction call = listing.getInstructionAt(from);
+                Function caller = listing.getFunctionContaining(from);
+                AddressRange range = caller == null ? null : caller.getBody().getRangeContaining(from);
+                if (call == null || range == null || !isDirectCall(call)) {
+                    continue;
+                }
+                calls++;
+                Instruction start = call;
+                for (int lead = 0; lead <= PATTERN_LEAD && start != null; lead++) {
+                    int callAt = (int) from.subtract(start.getMinAddress());
+                    Sequence sequence = sequence(start, range, true, callAt);
+                    if (sequence != null) {
+                        sequences.add(sequence);
+                    }
+                    Instruction previous = listing.getInstructionBefore(start.getMinAddress());
+                    boolean adjacent = previous != null && range.contains(previous.getMinAddress())
+                        && previous.getMaxAddress().next().equals(start.getMinAddress());
+                    start = adjacent ? previous : null;
+                }
+            }
+            return sequences;
+        }
+
+        /** Whether an instruction is a `call` or `jmp` with a 32-bit displacement, E8 or E9. */
+        private boolean isDirectCall(Instruction instruction) {
+            try {
+                byte opcode = instruction.getByte(0);
+                return instruction.getLength() == 5 && (opcode == (byte) 0xe8 || opcode == (byte) 0xe9);
+            } catch (MemoryAccessException e) {
+                return false;
+            }
+        }
+
+        /**
+         * Reads instructions from `first` while they follow on from each other inside `range`, up
+         * to the longest pattern.
+         */
+        private Sequence sequence(Instruction first, AddressRange range, boolean followCall,
+                int callAt) {
+            byte[] bytes = new byte[PATTERN_BYTES];
+            boolean[] fixed = new boolean[PATTERN_BYTES];
+            int[] ends = new int[PATTERN_BYTES];
+            int length = 0;
+            int count = 0;
+            Instruction instruction = first;
+            while (instruction != null && range.contains(instruction.getMaxAddress())) {
+                byte[] own;
+                try {
+                    own = instruction.getBytes();
+                } catch (MemoryAccessException e) {
+                    break;
+                }
+                if (length + own.length > PATTERN_BYTES) {
+                    break;
+                }
+                boolean[] wild = wildcards(instruction, own.length);
+                for (int i = 0; i < own.length; i++) {
+                    bytes[length + i] = own[i];
+                    fixed[length + i] = !wild[i];
+                }
+                length += own.length;
+                ends[count++] = length;
+                Instruction next = instruction.getNext();
+                Address after = instruction.getMaxAddress().next();
+                instruction = next != null && next.getMinAddress().equals(after) ? next : null;
+            }
+            return count == 0 || followCall && length < callAt + 5 ? null
+                : new Sequence(first.getMinAddress(), bytes, fixed, Arrays.copyOf(ends, count),
+                    followCall, callAt);
+        }
+
+        /**
+         * Returns which of an instruction's bytes hold an address: a branch target, a
+         * RIP-relative displacement, or anything the loader relocates.
+         */
+        private boolean[] wildcards(Instruction instruction, int length) {
+            boolean[] wild = new boolean[length];
+            InstructionPrototype prototype = instruction.getPrototype();
+            for (int operand = 0; operand < instruction.getNumOperands(); operand++) {
+                Mask mask = holdsAddress(instruction, operand)
+                    ? prototype.getOperandValueMask(operand) : null;
+                if (mask == null) {
+                    continue;
+                }
+                byte[] bits = mask.getBytes();
+                for (int i = 0; i < Math.min(length, bits.length); i++) {
+                    // Whole bytes only: a ModR/M byte also holds the opcode's and registers' bits.
+                    if (bits[i] == (byte) 0xff) {
+                        wild[i] = true;
+                    }
+                }
+            }
+            Address start = instruction.getMinAddress();
+            Iterator<Relocation> relocations = program.getRelocationTable()
+                .getRelocations(new AddressSet(start, instruction.getMaxAddress()));
+            while (relocations.hasNext()) {
+                Relocation relocation = relocations.next();
+                long from = relocation.getAddress().subtract(start);
+                long to = from + Math.max(relocation.getLength(), 1);
+                for (long i = Math.max(from, 0); i < Math.min(to, length); i++) {
+                    wild[(int) i] = true;
+                }
+            }
+            return wild;
+        }
+
+        private boolean holdsAddress(Instruction instruction, int operand) {
+            if (OperandType.isRelative(instruction.getOperandType(operand))) {
+                return true;
+            }
+            for (Reference reference : instruction.getOperandReferences(operand)) {
+                if (reference.getToAddress().isMemoryAddress() && !reference.isStackReference()) {
+                    return true;
+                }
+            }
+            for (Object object : instruction.getOpObjects(operand)) {
+                if (object instanceof Register register && register.getName().equalsIgnoreCase("rip")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** Records where each sequence's anchor occurs, in one pass over the executable bytes. */
+        private void index(Collection<Sequence> sequences) throws Exception {
+            anchors.clear();
+            boolean[] wanted = new boolean[1 << 24];
+            for (Sequence sequence : sequences) {
+                int anchor = sequence.anchor();
+                if (anchor >= 0) {
+                    int key = key(sequence.bytes(), anchor);
+                    wanted[key] = true;
+                    anchors.computeIfAbsent(key, k -> new LongList());
+                }
+            }
+            for (int block = 0; block < contents.size(); block++) {
+                monitor.checkCancelled();
+                byte[] bytes = contents.get(block);
+                for (int i = 0; i + 3 <= bytes.length; i++) {
+                    int key = key(bytes, i);
+                    if (wanted[key]) {
+                        anchors.get(key).add(pack(block, i));
+                    }
+                }
+            }
+        }
+
+        /**
+         * Returns the shortest start of `sequence`, ending after an instruction, that matches
+         * nowhere else, or null.
+         */
+        private BytePattern unique(Sequence sequence) {
+            int anchor = sequence.anchor();
+            long own = position(sequence.start());
+            if (anchor < 0 || own < 0) {
+                return null;
+            }
+            // Every place the anchor occurs, moved back to where the sequence would start.
+            LongList positions = anchors.get(key(sequence.bytes(), anchor));
+            if (candidates.length < positions.size) {
+                candidates = new long[positions.size];
+            }
+            int count = 0;
+            for (int i = 0; i < positions.size; i++) {
+                long position = positions.items[i];
+                int start = offset(position) - anchor;
+                if (start >= 0) {
+                    candidates[count++] = pack(block(position), start);
+                }
+            }
+            int checked = 0;
+            for (int end : sequence.ends()) {
+                int kept = 0;
+                for (int i = 0; i < count; i++) {
+                    if (matches(sequence, candidates[i], checked, end)) {
+                        candidates[kept++] = candidates[i];
+                    }
+                }
+                count = kept;
+                checked = end;
+                if (end >= anchor + 3 && end >= sequence.minimum() && count <= 1) {
+                    return count == 1 && candidates[0] == own
+                        ? new BytePattern(sequence.bytes(), sequence.fixed(), end,
+                            sequence.callAt(), sequence.followCall())
+                        : null;
+                }
+            }
+            return null;
+        }
+
+        /** Whether the fixed bytes `from` to `to` of a sequence match at a position. */
+        private boolean matches(Sequence sequence, long position, int from, int to) {
+            byte[] bytes = contents.get(block(position));
+            int start = offset(position);
+            if (start + to > bytes.length) {
+                return false;
+            }
+            for (int i = from; i < to; i++) {
+                if (sequence.fixed()[i] && bytes[start + i] != sequence.bytes()[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** Returns an address's packed position in the executable bytes, or -1. */
+        private long position(Address address) {
+            for (int block = 0; block < blocks.size(); block++) {
+                if (blocks.get(block).contains(address)) {
+                    return pack(block, (int) address.subtract(blocks.get(block).getStart()));
+                }
+            }
+            return -1;
+        }
+
+        private static int key(byte[] bytes, int at) {
+            return (bytes[at] & 0xff) << 16 | (bytes[at + 1] & 0xff) << 8 | bytes[at + 2] & 0xff;
+        }
+
+        private static long pack(int block, int offset) {
+            return (long) block << 32 | offset & 0xffff_ffffL;
+        }
+
+        private static int block(long position) {
+            return (int) (position >>> 32);
+        }
+
+        private static int offset(long position) {
+            return (int) position;
         }
     }
 }

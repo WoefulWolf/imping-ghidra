@@ -5,6 +5,7 @@
 //! since Ghidra analyses the whole program including its standard library.
 
 use imping_ir::{Architecture, Function, Ir, Module, Primitive, TypeDef, TypeId, TypeKind};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -46,8 +47,9 @@ struct Pe {
     image_base: u64,
     timestamp: u32,
     image_size: u32,
-    /// (virtual address, virtual size, file offset, file size) per section.
-    sections: Vec<(u32, u32, u32, u32)>,
+    /// (virtual address, virtual size, file offset, file size, characteristics) per
+    /// section.
+    sections: Vec<(u32, u32, u32, u32, u32)>,
 }
 
 impl Pe {
@@ -75,6 +77,7 @@ impl Pe {
                     u32_at(header + 8),
                     u32_at(header + 20),
                     u32_at(header + 16),
+                    u32_at(header + 36),
                 )
             })
             .collect();
@@ -89,14 +92,27 @@ impl Pe {
 
     /// Returns the file bytes at an RVA.
     fn at(&self, rva: u32, len: usize) -> &[u8] {
-        let (va, _, raw, _) = self
+        let (va, _, raw, _, _) = self
             .sections
             .iter()
             .copied()
-            .find(|&(va, size, _, raw_size)| rva >= va && rva < va + size.max(raw_size))
+            .find(|&(va, size, _, raw_size, _)| rva >= va && rva < va + size.max(raw_size))
             .unwrap_or_else(|| panic!("RVA {rva:#x} is in no section"));
         let offset = (raw + (rva - va)) as usize;
         &self.bytes[offset..offset + len]
+    }
+
+    /// Returns each executable section's RVA and bytes, the code a pattern is searched in.
+    fn code(&self) -> Vec<(u32, &[u8])> {
+        const EXECUTE: u32 = 0x2000_0000;
+        self.sections
+            .iter()
+            .filter(|&&(.., characteristics)| characteristics & EXECUTE != 0)
+            .map(|&(va, size, raw, raw_size, _)| {
+                let start = raw as usize;
+                (va, &self.bytes[start..start + size.min(raw_size) as usize])
+            })
+            .collect()
     }
 }
 
@@ -330,4 +346,90 @@ fn exports_globals() {
         .expect("fixture_gravity was exported");
     assert!(is_primitive(module, gravity.type_id, Primitive::F32));
     assert_eq!(pe.at(gravity.rva, 4), 9.81f32.to_le_bytes());
+}
+
+/// Parses a pattern like `48 8b ?? 57`, with `None` for a wildcard.
+fn parse_pattern(text: &str) -> Vec<Option<u8>> {
+    text.split(' ')
+        .map(|token| match token {
+            "??" => None,
+            hex => Some(u8::from_str_radix(hex, 16).expect("a hex byte")),
+        })
+        .collect()
+}
+
+#[test]
+fn byte_patterns_find_their_functions() {
+    let (module, pe) = exported();
+    let code = pe.code();
+    // Where every run of three bytes occurs; a pattern's first three fixed bytes
+    // in a row narrow down where it can match.
+    let mut runs: HashMap<[u8; 3], Vec<(usize, usize)>> = HashMap::new();
+    for (section, (_, bytes)) in code.iter().enumerate() {
+        for (at, run) in bytes.windows(3).enumerate() {
+            runs.entry(run.try_into().unwrap())
+                .or_default()
+                .push((section, at));
+        }
+    }
+
+    let mut with_pattern = 0;
+    for f in &module.functions {
+        let Some(pattern) = &f.pattern else {
+            continue;
+        };
+        with_pattern += 1;
+        let bytes = parse_pattern(&pattern.bytes);
+        let anchor = (0..bytes.len().saturating_sub(2))
+            .find(|&i| bytes[i..i + 3].iter().all(Option::is_some))
+            .unwrap_or_else(|| panic!("{}: `{}` has no anchor", f.name, pattern.bytes));
+        let run: Vec<u8> = bytes[anchor..anchor + 3]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let matches: Vec<u32> = runs[run.as_slice()]
+            .iter()
+            .filter_map(|&(section, at)| {
+                let (va, code) = code[section];
+                let start = at.checked_sub(anchor)?;
+                let window = code.get(start..start + bytes.len())?;
+                let fits = window
+                    .iter()
+                    .zip(&bytes)
+                    .all(|(byte, expected)| expected.is_none_or(|expected| expected == *byte));
+                fits.then_some(va + start as u32)
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "{}: `{}` matches {} places",
+            f.name,
+            pattern.bytes,
+            matches.len()
+        );
+        let mut rva = matches[0].wrapping_add_signed(pattern.offset);
+        if pattern.follow_call {
+            let displacement = i32::from_le_bytes(pe.at(rva + 1, 4).try_into().unwrap());
+            rva = (rva + 5).wrapping_add_signed(displacement);
+        }
+        assert_eq!(
+            rva, f.rva,
+            "{}: `{}` leads elsewhere",
+            f.name, pattern.bytes
+        );
+    }
+    println!(
+        "{with_pattern} of {} functions have a byte pattern",
+        module.functions.len()
+    );
+    // The rest are mostly tiny or identical standard library functions.
+    for f in module
+        .functions
+        .iter()
+        .filter(|f| f.namespace == ["fixture"])
+    {
+        assert!(f.pattern.is_some(), "{} has no pattern", f.name);
+    }
 }
