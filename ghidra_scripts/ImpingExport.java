@@ -4,7 +4,8 @@
 // Names Ghidra generated (FUN_..., DAT_..., Unwind@..., switchdataD_..., RTTI
 // labels) are skipped. A struct's field at offset 0 is marked as its base class
 // when x64 RTTI says so, or else when the field is named `base`. Each function
-// also gets a byte pattern that finds it if a later build moves it.
+// also gets a byte pattern that finds it if a later build moves it, and x64
+// vtables are exported with their RTTI type name, which finds them again too.
 //
 // In the GUI the script asks where to save the file. Headless, pass the output
 // path as the script's argument:
@@ -130,9 +131,10 @@ public class ImpingExport extends GhidraScript {
             println("imping: warning: " + warning);
         }
         println(String.format(
-            "imping: exported %d functions (%d with byte patterns), %d globals and %d types to %s",
+            "imping: exported %d functions (%d with byte patterns), %d globals, %d vtables and %d"
+                + " types to %s",
             exporter.functions.size(), exporter.patterns.size(), exporter.globals.size(),
-            exporter.types.size(), output));
+            exporter.vtables.size(), exporter.types.size(), output));
     }
 
     /** Returns the output file: the script's argument, or else one the user picks. */
@@ -162,6 +164,13 @@ public class ImpingExport extends GhidraScript {
 
     /** One base class RTTI lists for a class: its name, offset and whether it's virtual. */
     private record RttiBase(String name, int offset, boolean isVirtual) {}
+
+    /**
+     * A vtable found through x64 RTTI: its address, name and namespace, the class's decorated
+     * type name, the locator's offset, and the functions in its slots.
+     */
+    private record VtableItem(Address address, String name, List<String> namespace,
+            String typeName, int offset, List<Address> entries) {}
 
     /** One field of a struct or union, resolved to type ids. */
     private record FieldEntry(String name, int type, long offset, int bitOffset, int bitWidth,
@@ -243,6 +252,8 @@ public class ImpingExport extends GhidraScript {
         final List<GlobalItem> globals = new ArrayList<>();
         final List<TypeEntry> types = new ArrayList<>();
         final Map<Function, BytePattern> patterns = new HashMap<>();
+        final Map<Function, String> shapes = new HashMap<>();
+        final List<VtableItem> vtables = new ArrayList<>();
         /** Contradictions found while exporting, for the user to check. */
         final List<String> warnings = new ArrayList<>();
         private final Map<String, Integer> typeIds = new HashMap<>();
@@ -309,7 +320,10 @@ public class ImpingExport extends GhidraScript {
             for (GlobalItem global : globals) {
                 globalType(global.data());
             }
-            patterns.putAll(new PatternMaker(program).find(functions));
+            PatternMaker maker = new PatternMaker(program);
+            patterns.putAll(maker.find(functions));
+            shapes.putAll(maker.shapes);
+            vtables.addAll(vtables());
             List<String> unmatched = new ArrayList<>();
             for (Function function : functions) {
                 if (!patterns.containsKey(function)) {
@@ -391,6 +405,12 @@ public class ImpingExport extends GhidraScript {
                 json.endObject();
             }
             json.endArray();
+
+            json.name("vtables").beginArray();
+            for (VtableItem vtable : vtables) {
+                writeVtable(json, vtable);
+            }
+            json.endArray();
             json.endObject();
         }
 
@@ -431,6 +451,10 @@ public class ImpingExport extends GhidraScript {
             String verification = verification(function);
             if (!verification.isEmpty()) {
                 json.name("verification").value(verification);
+            }
+            String shape = shapes.get(function);
+            if (shape != null && !shape.isEmpty()) {
+                json.name("shape").value(shape);
             }
             BytePattern pattern = patterns.get(function);
             if (pattern != null) {
@@ -512,15 +536,51 @@ public class ImpingExport extends GhidraScript {
         }
 
         private void writeNamespace(JsonWriter json, Namespace namespace) throws IOException {
+            writePath(json, path(namespace));
+        }
+
+        /** Returns a namespace's path, outermost first, without the global namespace. */
+        private static List<String> path(Namespace namespace) {
             List<String> path = new ArrayList<>();
             for (Namespace current = namespace; current != null && !current.isGlobal();
                     current = current.getParentNamespace()) {
                 path.add(current.getName());
             }
+            Collections.reverse(path);
+            return path;
+        }
+
+        private void writeVtable(JsonWriter json, VtableItem vtable) throws IOException {
+            json.beginObject();
+            json.name("name").value(vtable.name());
+            writePath(json, vtable.namespace());
+            json.name("rva").value(hex(rva(vtable.address())));
+            json.name("rtti").beginObject();
+            json.name("type_name").value(vtable.typeName());
+            if (vtable.offset() != 0) {
+                json.name("offset").value(vtable.offset());
+            }
+            json.endObject();
+            json.name("entries").beginArray();
+            for (int index = 0; index < vtable.entries().size(); index++) {
+                Address target = vtable.entries().get(index);
+                json.beginObject();
+                json.name("index").value(index);
+                Function function = listing.getFunctionAt(target);
+                if (function != null && function.getSymbol().getSource() != SourceType.DEFAULT) {
+                    json.name("name").value(function.getName());
+                }
+                json.name("rva").value(hex(rva(target)));
+                json.endObject();
+            }
+            json.endArray();
+            json.endObject();
+        }
+
+        private void writePath(JsonWriter json, List<String> path) throws IOException {
             if (path.isEmpty()) {
                 return;
             }
-            Collections.reverse(path);
             json.name("namespace").beginArray();
             for (String segment : path) {
                 json.value(segment);
@@ -1143,6 +1203,109 @@ public class ImpingExport extends GhidraScript {
             }
         }
 
+        /**
+         * Finds the vtables x64 RTTI describes: a pointer to a complete object locator, then
+         * pointers to functions.
+         */
+        private List<VtableItem> vtables() throws Exception {
+            List<VtableItem> found = new ArrayList<>();
+            if (!x64) {
+                return found;
+            }
+            // Locators by RVA, as {type descriptor RVA, offset}: signature 1, and pSelf at +20
+            // holding the locator's own RVA.
+            Map<Long, long[]> locators = new HashMap<>();
+            Map<Long, ByteBuffer> blocks = new HashMap<>();
+            for (MemoryBlock block : memory.getBlocks()) {
+                long start = rva(block.getStart());
+                if (!block.isInitialized() || !block.isLoaded() || block.isExecute() || start < 0
+                        || block.getSize() > Integer.MAX_VALUE) {
+                    continue;
+                }
+                byte[] bytes = new byte[(int) block.getSize()];
+                try {
+                    block.getBytes(block.getStart(), bytes);
+                } catch (MemoryAccessException e) {
+                    continue;
+                }
+                ByteBuffer data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+                blocks.put(start, data);
+                for (int offset = 0; offset + 24 <= bytes.length; offset += 4) {
+                    if (data.getInt(offset) == 1
+                            && Integer.toUnsignedLong(data.getInt(offset + 20)) == start + offset) {
+                        locators.put(start + offset, new long[] {
+                            Integer.toUnsignedLong(data.getInt(offset + 12)),
+                            Integer.toUnsignedLong(data.getInt(offset + 4))});
+                    }
+                }
+            }
+            DataValidationOptions options = new DataValidationOptions();
+            for (Map.Entry<Long, ByteBuffer> block : blocks.entrySet()) {
+                monitor.checkCancelled();
+                ByteBuffer data = block.getValue();
+                for (int offset = 0; offset + 16 <= data.capacity(); offset += 8) {
+                    long[] locator = locators.get(data.getLong(offset) - imageBase.getOffset());
+                    if (locator == null) {
+                        continue;
+                    }
+                    Address address = imageBase.add(block.getKey() + offset + 8);
+                    List<Address> entries = new ArrayList<>();
+                    for (int slot = offset + 8; slot + 8 <= data.capacity(); slot += 8) {
+                        Address target;
+                        try {
+                            target = imageBase.getNewAddress(data.getLong(slot));
+                        } catch (AddressOutOfBoundsException e) {
+                            break;
+                        }
+                        MemoryBlock targetBlock = memory.getBlock(target);
+                        if (targetBlock == null || !targetBlock.isExecute()) {
+                            break;
+                        }
+                        entries.add(target);
+                    }
+                    String typeName = typeName(locator[0]);
+                    if (entries.isEmpty() || typeName == null) {
+                        continue;
+                    }
+                    Symbol symbol = program.getSymbolTable().getPrimarySymbol(address);
+                    String name = symbol != null ? symbol.getName() : "vftable";
+                    List<String> namespace;
+                    if (symbol != null) {
+                        namespace = path(symbol.getParentNamespace());
+                    } else {
+                        String className = className(locator[0], options);
+                        namespace = className == null ? List.of() : splitPath(className);
+                    }
+                    found.add(new VtableItem(address, name, namespace, typeName,
+                        (int) locator[1], entries));
+                }
+            }
+            found.sort((a, b) -> a.address().compareTo(b.address()));
+            return found;
+        }
+
+        /** Returns a type descriptor's decorated name, e.g. `.?AVEntity@game@@`, or null. */
+        private String typeName(long typeDescriptor) {
+            try {
+                Address name = imageBase.add(typeDescriptor + 16);
+                StringBuilder text = new StringBuilder();
+                for (int i = 0; i < 4096; i++) {
+                    byte b = memory.getByte(name.add(i));
+                    if (b == 0) {
+                        return text.toString().startsWith(".?A") ? text.toString() : null;
+                    }
+                    // Decorated names are printable ASCII; anything else isn't a name.
+                    if (b < 0x20 || b > 0x7e) {
+                        return null;
+                    }
+                    text.append((char) b);
+                }
+                return null;
+            } catch (MemoryAccessException | AddressOutOfBoundsException e) {
+                return null;
+            }
+        }
+
         // -------------------------------------------------------------- helpers
 
         private boolean isLoaded(Address address) {
@@ -1175,6 +1338,8 @@ public class ImpingExport extends GhidraScript {
         /** Where each wanted 3-byte anchor occurs, as {@link #pack}ed positions. */
         private final Map<Integer, LongList> anchors = new HashMap<>();
         private long[] candidates = new long[1024];
+        /** Each function's first bytes with addresses as wildcards, filled by {@link #find}. */
+        final Map<Function, String> shapes = new HashMap<>();
 
         PatternMaker(Program program) throws MemoryAccessException {
             this.program = program;
@@ -1202,6 +1367,13 @@ public class ImpingExport extends GhidraScript {
                     range == null || first == null ? null : sequence(first, range, false, 0);
                 if (sequence != null) {
                     entries.put(function, sequence);
+                    int length = Math.min(sequence.ends()[sequence.ends().length - 1],
+                        VERIFICATION_BYTES);
+                    String shape =
+                        new BytePattern(sequence.bytes(), sequence.fixed(), length, 0, false).text();
+                    if (!shape.isEmpty()) {
+                        shapes.put(function, shape);
+                    }
                 }
             }
             index(entries.values());

@@ -20,8 +20,9 @@ analyzeHeadless.bat <project dir> <project name> -process target.exe -noanalysis
 - **Namespaces** from Ghidra's namespaces and classes, and from `::` in type names (`Hw::cVec4`).
 - **Base classes:** a struct's field at offset 0 is marked as its base when the program's MSVC RTTI says so (x64), or else when it's named `base`. Where RTTI disagrees with a field named `base`, the export prints a warning saying why.
 - **Safe calls:** tag a function `imping-safe` when it's always fine to call with valid arguments and keeps none of its pointer arguments. Its binding then needs no `unsafe`.
-- **Verification bytes:** up to 16 of each function's first bytes, so hooks can check they patch the code they expect.
+- **Verification bytes:** up to 16 of each function's first bytes, so hooks can check they patch the code they expect, plus the same bytes with their addresses left out, which still fit once addresses change.
 - **Byte patterns:** a short pattern per function, unique in the program's code with its addresses left out, so the function can still be found when a later build moves it. Functions too small or too alike to tell apart get none; the export says how many.
+- **Vtables** (x64) with their class's RTTI type name, which finds them again in a later build, and through them the virtual functions patterns can't tell apart.
 
 Early development. Supports x86 and x64 PE programs; tested with Ghidra 12.1.2.
 

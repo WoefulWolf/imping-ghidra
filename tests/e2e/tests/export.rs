@@ -433,3 +433,27 @@ fn byte_patterns_find_their_functions() {
         assert!(f.pattern.is_some(), "{} has no pattern", f.name);
     }
 }
+
+#[test]
+fn shapes_match_the_executable() {
+    let (module, pe) = exported();
+    for f in &module.functions {
+        if f.shape.is_empty() {
+            continue;
+        }
+        let shape = parse_pattern(&f.shape);
+        let bytes = pe.at(f.rva, shape.len());
+        let fits = bytes
+            .iter()
+            .zip(&shape)
+            .all(|(byte, expected)| expected.is_none_or(|expected| expected == *byte));
+        assert!(fits, "{}: `{}` against {bytes:02x?}", f.name, f.shape);
+    }
+    for f in module
+        .functions
+        .iter()
+        .filter(|f| f.namespace == ["fixture"])
+    {
+        assert!(!f.shape.is_empty(), "{} has no shape", f.name);
+    }
+}
